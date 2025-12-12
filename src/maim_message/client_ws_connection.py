@@ -555,6 +555,20 @@ class ClientNetworkDriver:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
+        # 添加全局异常处理器以屏蔽关闭时的噪声
+        def ignore_shutdown_noise(loop, context):
+            message = context.get("message", "")
+            # 屏蔽 asyncio 关闭时的常见噪声
+            if "Event loop is closed" in message or "Task was destroyed" in message:
+                return
+            # 屏蔽 connection_loop 相关的 Coroutine 警告
+            if "connection_loop" in str(context.get("future", "")):
+                return
+            # 默认处理
+            loop.default_exception_handler(context)
+        
+        loop.set_exception_handler(ignore_shutdown_noise)
+
         try:
             # 设置事件队列和主循环引用
             self.event_queue = event_queue
@@ -564,11 +578,38 @@ class ClientNetworkDriver:
             # 运行连接管理循环
             loop.run_until_complete(self._manage_connections())
 
+
+
         except Exception as e:
             logger.error(f"Worker loop error: {e}")
         finally:
             self.running = False
-            loop.close()
+            
+            # 标准的 asyncio 优雅关闭流程
+            try:
+                # 1. 获取所有未完成的任务（排除当前任务如果存在）
+                pending = asyncio.all_tasks(loop)
+                if pending:
+                    logger.debug(f"Cleaning up {len(pending)} pending tasks in worker loop...")
+                    for task in pending:
+                        task.cancel()
+                    
+                    # 2. 运行直到所有任务取消完成
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                
+                # 3. 关闭异步生成器
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                
+                # 4. 关闭执行器 (如果有的话，默认是 None 但为了保险)
+                # await loop.shutdown_default_executor() # Python 3.9+ 
+                
+            except Exception as e:
+                logger.error(f"Error during worker loop graceful shutdown: {e}")
+            finally:
+                logger.debug("Worker loop closed")
+                loop.close()
 
     async def _manage_connections(self) -> None:
         """管理所有连接"""
@@ -608,6 +649,45 @@ class ClientNetworkDriver:
 
         logger.info("Client network driver started")
 
+    async def _cleanup_worker_tasks(self) -> None:
+        """在工作线程循环中清理所有任务（这是内部方法，必须在工作线程中运行）"""
+        logger.debug("🧹 正在工作线程中执行清理...")
+        
+        # 1. 取消所有连接任务
+        active_tasks = []
+        for connection_uuid, task in list(self.connection_tasks.items()):
+            if task and not task.done():
+                task.cancel()
+                active_tasks.append(task)
+        
+        # 2. 等待任务取消完成
+        if active_tasks:
+            logger.debug(f"⏳ 等待 {len(active_tasks)} 个连接任务取消...")
+            # 使用 return_exceptions=True 防止异常中断清理流程
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+            
+        # 3. 显式关闭所有活跃的 WebSocket 连接
+        # 虽然 connection_loop 被取消会触发 context manager 退出从而关闭 WS，
+        # 但显式关闭更安全，且能处理那些不在 context manager 管理下的连接（如果有）
+        close_futs = []
+        for connection_uuid, websocket in list(self.active_connections.items()):
+            try:
+                # 发送关闭帧，不等待对方确认以加快速度
+                close_futs.append(websocket.close())
+            except Exception:
+                pass
+        
+        if close_futs:
+            logger.debug(f"🔌 关闭 {len(close_futs)} 个活跃 WebSocket 连接...")
+            await asyncio.gather(*close_futs, return_exceptions=True)
+
+        # 4. 清理状态
+        self.active_connections.clear()
+        self.connection_tasks.clear()
+        self.connection_states.clear()
+        self.connections.clear()
+        logger.debug("✅ 工作线程资源清理完成")
+
     async def stop(self) -> None:
         """停止网络驱动器 - 完全清理所有协程"""
         if not self.running:
@@ -615,35 +695,32 @@ class ClientNetworkDriver:
 
         logger.info("Stopping client network driver...")
 
-        # 1. 首先发送关闭信号
+        # 1. 发送关闭信号
         self._shutdown_event.set()
         self.running = False
-
-        # 2. 取消所有连接协程
-        for connection_uuid, task in list(self.connection_tasks.items()):
-            if task and not task.done():
-                try:
-                    task.cancel()
-                    logger.debug(f"Cancelled task {connection_uuid}")
-                    # 等待任务完全结束，但设置超时
-                    try:
-                        await asyncio.wait_for(task, timeout=1.0)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        pass
-                except Exception as e:
-                    logger.debug(f"Error cancelling task {connection_uuid}: {e}")
-
-        # 3. 清理所有连接状态
-        self.active_connections.clear()
-        self.connection_tasks.clear()
-        self.connection_states.clear()
-        self.connections.clear()
-
-        # 4. 等待工作线程结束
+        
+        # 2. 在工作线程中执行清理
+        # 关键修复：必须在拥有这些 Task 的 loop 中执行 cancel/await
+        if self.main_loop and self.main_loop.is_running():
+            try:
+                cleanup_future = asyncio.run_coroutine_threadsafe(
+                    self._cleanup_worker_tasks(), 
+                    self.main_loop
+                )
+                # 等待清理完成，设置合理的超时
+                cleanup_future.result(timeout=3.0)
+            except Exception as e:
+                logger.warning(f"Error during worker cleanup dispatch: {e}")
+        
+        # 3. 等待工作线程结束
         if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=3.0)
-            if self.worker_thread.is_alive():
-                logger.warning("Worker thread did not stop gracefully")
+            try:
+                # 给线程一点时间自己退出
+                self.worker_thread.join(timeout=3.0)
+                if self.worker_thread.is_alive():
+                    logger.warning("Worker thread did not stop gracefully")
+            except Exception as e:
+                logger.error(f"Error joining worker thread: {e}")
 
         # 5. 重置统计信息
         self.stats = {
@@ -652,7 +729,12 @@ class ClientNetworkDriver:
             "messages_received": 0,
             "messages_sent": 0,
             "bytes_received": 0,
-            "bytes_sent": 0
+            "bytes_sent": 0,
+            "reconnect_attempts": 0,
         }
+        
+        # 重置引用
+        self.main_loop = None
+        self.worker_thread = None
 
         logger.info("Client network driver stopped completely")
