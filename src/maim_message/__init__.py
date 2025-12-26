@@ -1,6 +1,6 @@
 """Maim Message - A message handling library"""
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 # Legacy API Components (pre-API-Server Version) - 从根模块导入
 from .api import MessageClient, MessageServer
@@ -41,7 +41,6 @@ __all__ = [
     "InfoBase",
     "SenderInfo",
     "ReceiverInfo",
-
     # 注意：API-Server Version 组件需要从子模块导入：
     # - 消息相关: from maim_message.message import APIMessageBase, MessageDim, etc.
     # - 服务端: from maim_message.server import WebSocketServer, ServerConfig, etc.
