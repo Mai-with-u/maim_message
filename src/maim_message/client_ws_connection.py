@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set
 from enum import Enum
 
 import websockets
@@ -315,10 +315,10 @@ class ClientNetworkDriver:
 
                 logger.info(f"🚀 正在创建WebSocket连接到: {config.url}")
                 websocket_connect = websockets.connect(config.url, **ws_kwargs)
-                logger.info(f"✅ WebSocket连接对象已创建，开始握手...")
+                logger.info("✅ WebSocket连接对象已创建，开始握手...")
 
                 async with websocket_connect as websocket:
-                    logger.info(f"🤝 WebSocket握手成功，连接已建立")
+                    logger.info("🤝 WebSocket握手成功，连接已建立")
                     self.active_connections[connection_uuid] = websocket
                     self.connection_states[connection_uuid] = "connected"
                     reconnect_attempts = 0
@@ -374,7 +374,6 @@ class ClientNetworkDriver:
             # 重连逻辑 - 检查是否收到关闭信号
             should_reconnect = (self.running and
                 connection_uuid in self.connections and
-                reconnect_attempts < config.max_reconnect_attempts and
                 not self._shutdown_event.is_set())
 
             if should_reconnect:
@@ -385,9 +384,9 @@ class ClientNetworkDriver:
                 try:
                     logger.info(f"⏳ 等待 {reconnect_delay}s 后重连...")
                     await asyncio.wait_for(asyncio.sleep(reconnect_delay), timeout=30.0)
-                    logger.info(f"✅ 重连等待完成")
+                    logger.info("✅ 重连等待完成")
                 except asyncio.TimeoutError:
-                    logger.info(f"⏰ 重连等待超时，继续重连逻辑")
+                    logger.info("⏰ 重连等待超时，继续重连逻辑")
                     pass
 
                 # 检查关闭状态
@@ -401,9 +400,6 @@ class ClientNetworkDriver:
                 if connection_uuid in self.connections:
                     if self._shutdown_event.is_set():
                         logger.info(f"🛑 {connection_uuid} 优雅关闭")
-                    else:
-                        logger.info(f"❌ {connection_uuid} 达到最大重连次数")
-                        self.connection_states[connection_uuid] = "error"
                 else:
                     logger.info(f"🗑️ 连接 {connection_uuid} 已被移除，停止重连")
                 break
