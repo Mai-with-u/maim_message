@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="maim_message",
-    version="0.6.3",
+    version="0.6.4",
     author="tcmofashi",
     url="https://github.com/MaiM-with-u/maim_message",
     author_email="mofashiforzbx@qq.com",
