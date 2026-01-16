@@ -18,6 +18,9 @@ from .message_base import (
     ReceiverInfo,
 )
 
+# 消息格式转换器
+from .converter import MessageConverter
+
 # API-Server Version Components 不在根模块导出，需要从子模块导入
 # 消息相关组件 - 使用 from maim_message.message import
 # WebSocket服务端组件 - 使用 from maim_message.server import
@@ -41,6 +44,8 @@ __all__ = [
     "InfoBase",
     "SenderInfo",
     "ReceiverInfo",
+    # 消息格式转换器
+    "MessageConverter",
     # 注意：API-Server Version 组件需要从子模块导入：
     # - 消息相关: from maim_message.message import APIMessageBase, MessageDim, etc.
     # - 服务端: from maim_message.server import WebSocketServer, ServerConfig, etc.

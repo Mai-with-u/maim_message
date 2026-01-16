@@ -223,12 +223,8 @@ class BaseMessageInfo:
     platform: Optional[str] = None
     message_id: Optional[str] = None
     time: Optional[float] = None
-    group_info: Optional[GroupInfo] = (
-        None  # 注意，当前版本已由sender_info和receiver_info替代，即将废弃
-    )
-    user_info: Optional[UserInfo] = (
-        None  # 注意，当前版本已由sender_info和receiver_info替代，即将废弃
-    )
+    group_info: Optional[GroupInfo] = None
+    user_info: Optional[UserInfo] = None
     format_info: Optional[FormatInfo] = None
     template_info: Optional[TemplateInfo] = None
     additional_config: Optional[dict] = None
