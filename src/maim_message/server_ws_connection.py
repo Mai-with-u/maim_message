@@ -16,6 +16,8 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
+from .message_cache import MessageCache
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +84,7 @@ class ServerNetworkDriver:
         ssl_keyfile: str = None,
         ssl_ca_certs: str = None,
         ssl_verify: bool = False,
+        custom_logger: Optional[Any] = None,
     ):
         self.host = host
         self.port = port
@@ -93,6 +96,11 @@ class ServerNetworkDriver:
         self.ssl_keyfile = ssl_keyfile
         self.ssl_ca_certs = ssl_ca_certs
         self.ssl_verify = ssl_verify
+
+        if custom_logger is not None:
+            self.logger = custom_logger
+        else:
+            self.logger = logger
 
         # 连接管理
         self.active_connections: Dict[str, WebSocket] = {}
@@ -122,6 +130,9 @@ class ServerNetworkDriver:
         self._shutdown_event = asyncio.Event()
         self._server_task: Optional[asyncio.Task] = None
         self._uvicorn_server: Optional[uvicorn.Server] = None
+
+        # 消息缓存支持
+        self.message_cache: Optional[MessageCache] = None
 
     def _setup_routes(self) -> None:
         """设置WebSocket路由"""
@@ -162,6 +173,9 @@ class ServerNetworkDriver:
 
         # 5. 发送连接事件到业务层
         await self._send_event(EventType.CONNECT, connection_uuid)
+
+        # 6. 重发该连接的缓存消息
+        await self._retry_cached_messages(connection_uuid)
 
         try:
             # 6. 消息处理循环 - 优雅处理服务器关闭
@@ -271,6 +285,10 @@ class ServerNetworkDriver:
 
             await self._send_raw_message(connection_uuid, ack_message)
 
+            # 从缓存中移除已确认的消息
+            if self.message_cache and self.message_cache.enabled:
+                self.message_cache.remove(msg_id)
+
         except Exception as e:
             logger.error(f"Error sending ACK to {connection_uuid}: {e}")
 
@@ -302,11 +320,10 @@ class ServerNetworkDriver:
                         f"🔧 Created minimal metadata for cleanup: {connection_uuid}"
                     )
                 else:
-                    logger.error(
-                        f"❌ No metadata for connection {connection_uuid} - cannot send {event_type.value}"
-                    )
+                    # 对于其他事件，如果连接已清理，静默跳过不报错
+                    # 这可能发生在消息处理过程中连接意外断开的情况
                     logger.debug(
-                        f"Available connections: {list(self.connection_metadata.keys())}"
+                        f"⚠️  Connection {connection_uuid} metadata not found for {event_type.value} - likely already cleaned up"
                     )
                     return
 
@@ -390,12 +407,38 @@ class ServerNetworkDriver:
                 f"Debug: connection cleanup {connection_uuid} error: {type(e).__name__}: {str(e)}"
             )
 
+    async def _retry_cached_messages(self, connection_uuid: str) -> None:
+        """重发指定连接的缓存消息"""
+        if not self.message_cache or not self.message_cache.enabled:
+            return
+
+        cached_messages = self.message_cache.get_by_target(connection_uuid)
+        if not cached_messages:
+            return
+
+        logger.info(
+            f"Retrying {len(cached_messages)} cached messages for {connection_uuid}"
+        )
+
+        for cached in cached_messages:
+            try:
+                success = await self._send_raw_message(connection_uuid, cached.message)
+                if success:
+                    logger.debug(f"Retry succeeded: {cached.message_id}")
+            except Exception as e:
+                logger.debug(f"Retry error: {cached.message_id}, {e}")
+
     async def _send_raw_message(
         self, connection_uuid: str, message: Dict[str, Any]
     ) -> bool:
         """发送原始消息到指定连接"""
         if connection_uuid not in self.active_connections:
             logger.warning(f"Connection {connection_uuid} not found")
+
+            if self.message_cache and self.message_cache.enabled:
+                msg_id = message.get("msg_id", "")
+                if msg_id:
+                    self.message_cache.add(msg_id, message, connection_uuid)
             return False
 
         websocket = self.active_connections[connection_uuid]
@@ -412,7 +455,12 @@ class ServerNetworkDriver:
 
         except Exception as e:
             logger.error(f"Error sending message to {connection_uuid}: {e}")
-            # 连接可能已断开，清理它
+
+            if self.message_cache and self.message_cache.enabled:
+                msg_id = message.get("msg_id", "")
+                if msg_id:
+                    self.message_cache.add(msg_id, message, connection_uuid)
+
             await self._cleanup_connection(connection_uuid)
             return False
 
@@ -427,7 +475,6 @@ class ServerNetworkDriver:
         results = {}
 
         for connection_uuid, websocket in list(self.active_connections.items()):
-            # 应用过滤器
             if filter_func:
                 metadata = self.connection_metadata.get(connection_uuid)
                 if not filter_func(metadata):
@@ -437,6 +484,11 @@ class ServerNetworkDriver:
             results[connection_uuid] = success
 
         return results
+
+    def set_message_cache(self, message_cache: MessageCache) -> None:
+        """设置消息缓存实例"""
+        self.message_cache = message_cache
+        logger.info(f"Message cache set: enabled={message_cache.enabled}")
 
     async def disconnect_client(
         self, connection_uuid: str, reason: str = "Server initiated disconnect"
@@ -634,5 +686,9 @@ class ServerNetworkDriver:
             "bytes_received": 0,
             "bytes_sent": 0,
         }
+
+        # 8. 清理消息缓存
+        if self.message_cache:
+            await self.message_cache.stop()
 
         logger.info("Network driver stopped completely")

@@ -13,8 +13,6 @@ from .client_ws_connection import EventType, NetworkEvent, ConnectionConfig
 from .message import APIMessageBase
 from .ws_config import ClientConfig
 
-logger = logging.getLogger(__name__)
-
 
 class WebSocketClient(WebSocketClientBase):
     """WebSocket 单连接客户端 - 专门用于单连接场景
@@ -50,10 +48,12 @@ class WebSocketClient(WebSocketClientBase):
         self._connection_uuid: Optional[str] = None
 
         # 继承基类的统计信息，添加连接相关统计
-        self.stats.update({
-            "connection_uuid": None,
-            "cached_connection": {},
-        })
+        self.stats.update(
+            {
+                "connection_uuid": None,
+                "cached_connection": {},
+            }
+        )
 
     def update_config(self, **kwargs) -> None:
         """更新配置"""
@@ -62,11 +62,11 @@ class WebSocketClient(WebSocketClientBase):
                 setattr(self.config, key, value)
                 self.logger.info(f"客户端配置更新: {key} = {value}")
                 # 更新缓存的连接参数
-                if key == 'url':
+                if key == "url":
                     self._cached_url = value
-                elif key == 'api_key':
+                elif key == "api_key":
                     self._cached_api_key = value
-                elif key == 'platform':
+                elif key == "platform":
                     self._cached_platform = value
             else:
                 self.logger.warning(f"无效的配置项: {key}")
@@ -76,7 +76,9 @@ class WebSocketClient(WebSocketClientBase):
             raise ValueError("更新后的配置验证失败")
         self.config.ensure_defaults()
 
-    def register_custom_handler(self, message_type: str, handler: Callable[[Dict[str, Any]], None]) -> None:
+    def register_custom_handler(
+        self, message_type: str, handler: Callable[[Dict[str, Any]], None]
+    ) -> None:
         """注册自定义消息处理器"""
         self.config.register_custom_handler(message_type, handler)
         # 同时更新基类的处理器
@@ -102,7 +104,7 @@ class WebSocketClient(WebSocketClientBase):
             "url": self._cached_url,
             "api_key": self._cached_api_key,
             "platform": self._cached_platform,
-            "connection_uuid": self._connection_uuid
+            "connection_uuid": self._connection_uuid,
         }
 
         self.logger.info(f"已连接到服务器 ({self._connection_uuid})")
@@ -204,26 +206,29 @@ class WebSocketClient(WebSocketClientBase):
         if not self._connection_uuid:
             return False
 
-        # 构造消息包，使用缓存的连接参数作为发送者信息
         message_package = {
             "ver": 1,
-            "msg_id": f"msg_{int(time.time() * 1000)}",
+            "msg_id": f"msg_{uuid.uuid4().hex[:12]}_{int(time.time())}",
             "type": "sys_std",
             "meta": {
-                "sender_user": self._cached_api_key,      # 使用缓存的API Key
-                "platform": self._cached_platform,        # 使用缓存的平台
+                "sender_user": self._cached_api_key,
+                "platform": self._cached_platform,
                 "timestamp": time.time(),
             },
-            "payload": message.to_dict()
+            "payload": message.to_dict(),
         }
 
-        success = await self.network_driver.send_message(self._connection_uuid, message_package)
+        success = await self.network_driver.send_message(
+            self._connection_uuid, message_package
+        )
         if success:
             self.stats["messages_sent"] += 1
 
         return success
 
-    async def send_custom_message(self, message_type: str, payload: Dict[str, Any]) -> bool:
+    async def send_custom_message(
+        self, message_type: str, payload: Dict[str, Any]
+    ) -> bool:
         """发送自定义消息
 
         Args:
@@ -240,24 +245,24 @@ class WebSocketClient(WebSocketClientBase):
         if not self._connection_uuid:
             return False
 
-        # 确保类型前缀
         if not message_type.startswith("custom_"):
             message_type = f"custom_{message_type}"
 
-        # 构造自定义消息包，使用缓存的连接参数
         message_package = {
             "ver": 1,
-            "msg_id": f"custom_{int(time.time() * 1000)}",
+            "msg_id": f"custom_{uuid.uuid4().hex[:12]}_{int(time.time())}",
             "type": message_type,
             "meta": {
-                "sender_user": self._cached_api_key,      # 使用缓存的API Key
-                "platform": self._cached_platform,        # 使用缓存的平台
+                "sender_user": self._cached_api_key,
+                "platform": self._cached_platform,
                 "timestamp": time.time(),
             },
-            "payload": payload
+            "payload": payload,
         }
 
-        success = await self.network_driver.send_message(self._connection_uuid, message_package)
+        success = await self.network_driver.send_message(
+            self._connection_uuid, message_package
+        )
         if success:
             self.stats["messages_sent"] += 1
 
@@ -269,7 +274,7 @@ class WebSocketClient(WebSocketClientBase):
             "url": self._cached_url,
             "api_key": self._cached_api_key,
             "platform": self._cached_platform,
-            "connection_uuid": self._connection_uuid or ""
+            "connection_uuid": self._connection_uuid or "",
         }
 
     def get_connection_uuid(self) -> Optional[str]:

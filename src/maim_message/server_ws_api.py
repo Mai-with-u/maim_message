@@ -5,14 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable, Dict, Optional, Set, List
-from dataclasses import dataclass
+import uuid
+from typing import Any, Callable, Dict, Optional, Set
 
 from .server_ws_connection import ServerNetworkDriver, EventType, NetworkEvent
 from .message import APIMessageBase, BaseMessageInfo, Seg, MessageDim
 from .ws_config import ServerConfig, AuthResult
-
-logger = logging.getLogger(__name__)
 
 
 class WebSocketServer:
@@ -40,6 +38,7 @@ class WebSocketServer:
             self.config.ssl_keyfile,
             self.config.ssl_ca_certs,
             self.config.ssl_verify,
+            custom_logger=self.config.custom_logger,
         )
 
         # 业务状态管理 - 三级映射表 Map<UserID, Map<Platform, Set<UUID>>>
@@ -53,6 +52,10 @@ class WebSocketServer:
         self.connection_metadata: Dict[
             str, Dict[str, Any]
         ] = {}  # connection_uuid -> metadata
+
+        # 消息去重机制
+        self._processed_messages: Dict[str, float] = {}  # msg_id -> timestamp
+        self._message_history_ttl = 3600  # 1小时过期
 
         # 跨线程事件队列
         self.event_queue: asyncio.Queue = asyncio.Queue()
@@ -69,6 +72,7 @@ class WebSocketServer:
             "current_users": 0,
             "current_connections": 0,
             "active_handler_tasks": 0,
+            "duplicate_messages_ignored": 0,
         }
 
         # 异步任务管理
@@ -121,10 +125,15 @@ class WebSocketServer:
         async def task_wrapper():
             try:
                 await coro
-                self.logger.debug(f"✅ Handler task {task_id} ({description}) 完成")
+                self.logger.debug(
+                    f"✅ Handler task {task_id} ({description}) 完成"
+                )
             except Exception as e:
-                self.logger.error(f"❌ Handler task {task_id} ({description}) 异常: {e}")
+                self.logger.error(
+                    f"❌ Handler task {task_id} ({description}) 异常: {e}"
+                )
                 import traceback
+
                 self.logger.error(f"   Traceback: {traceback.format_exc()}")
             finally:
                 # 任务完成后自动清理
@@ -136,7 +145,9 @@ class WebSocketServer:
         self.active_handler_tasks.add(task)
         self.stats["active_handler_tasks"] = len(self.active_handler_tasks)
 
-        self.logger.debug(f"🚀 Handler task {task_id} ({description}) 已创建，当前活跃任务数: {len(self.active_handler_tasks)}")
+        self.logger.debug(
+            f"🚀 Handler task {task_id} ({description}) 已创建，当前活跃任务数: {len(self.active_handler_tasks)}"
+        )
 
     async def _authenticate_connection(self, metadata: Dict[str, Any]) -> AuthResult:
         """认证连接"""
@@ -168,7 +179,6 @@ class WebSocketServer:
         """处理连接事件"""
         metadata = event.metadata.to_dict()
         connection_uuid = event.metadata.uuid
-        api_key = event.metadata.api_key
         platform = event.metadata.platform
 
         # 认证连接
@@ -207,7 +217,9 @@ class WebSocketServer:
         self.stats["current_users"] = len(self.user_connections)
         self.stats["current_connections"] = len(self.connection_users)
 
-        self.logger.info(f"用户 {user_id} 从 {platform} 平台连接 ({connection_uuid})")
+        self.logger.info(
+            f"用户 {user_id} 从 {platform} 平台连接 ({connection_uuid})"
+        )
 
     async def _handle_disconnect_event(self, event: NetworkEvent) -> None:
         """处理断连事件"""
@@ -257,6 +269,17 @@ class WebSocketServer:
             # 解析消息
             message_data = event.payload
             message_type = message_data.get("type", "unknown")
+            msg_id = message_data.get("msg_id")
+
+            # 去重检查
+            if msg_id and msg_id in self._processed_messages:
+                self.stats["duplicate_messages_ignored"] += 1
+                self.logger.debug(f"重复消息已忽略: {msg_id}")
+                return
+
+            # 标记为已处理
+            if msg_id:
+                self._processed_messages[msg_id] = time.time()
 
             # 处理标准消息
             if message_type == "sys_std":
@@ -303,7 +326,7 @@ class WebSocketServer:
             try:
                 await self._create_handler_task(
                     self.config.on_message(server_message, event.metadata.to_dict()),
-                    f"标准消息处理器-{event.metadata.platform}"
+                    f"标准消息处理器-{event.metadata.platform}",
                 )
             except Exception as e:
                 self.logger.error(f"创建标准消息处理器任务错误: {e}")
@@ -323,8 +346,7 @@ class WebSocketServer:
                 # 传递连接元数据给处理器
                 metadata = event.metadata.to_dict()
                 await self._create_handler_task(
-                    handler(message_data, metadata),
-                    f"自定义消息处理器-{message_type}"
+                    handler(message_data, metadata), f"自定义消息处理器-{message_type}"
                 )
             except Exception as e:
                 self.logger.error(f"创建自定义处理器任务错误 {message_type}: {e}")
@@ -334,14 +356,20 @@ class WebSocketServer:
     async def _dispatcher_loop(self) -> None:
         """事件分发循环"""
         self.logger.info("Event dispatcher started")
-        self.logger.debug(f"🔍 Event queue: {self.event_queue}, Running: {self.running}")
+        self.logger.debug(
+            f"🔍 Event queue: {self.event_queue}, Running: {self.running}"
+        )
 
         while self.running:
             try:
-                # 获取事件
                 self.logger.debug(
                     f"⏳ Waiting for event from queue (current size: {self.event_queue.qsize()})"
                 )
+
+                queue_size = self.event_queue.qsize()
+                if queue_size > 100:
+                    self.logger.warning(f"事件队列积压严重: {queue_size}")
+
                 event = await asyncio.wait_for(self.event_queue.get(), timeout=1.0)
 
                 self.logger.debug(
@@ -350,18 +378,24 @@ class WebSocketServer:
 
                 # 分发事件
                 if event.event_type == EventType.CONNECT:
-                    self.logger.debug(f"🔗 Processing CONNECT event for {event.uuid}")
+                    self.logger.debug(
+                        f"🔗 Processing CONNECT event for {event.uuid}"
+                    )
                     await self._handle_connect_event(event)
                 elif event.event_type == EventType.DISCONNECT:
-                    self.logger.debug(f"🔌 Processing DISCONNECT event for {event.uuid}")
+                    self.logger.debug(
+                        f"🔌 Processing DISCONNECT event for {event.uuid}"
+                    )
                     await self._handle_disconnect_event(event)
                 elif event.event_type == EventType.MESSAGE:
-                    self.logger.debug(f"💬 Processing MESSAGE event for {event.uuid}")
+                    self.logger.debug(
+                        f"💬 Processing MESSAGE event for {event.uuid}"
+                    )
                     await self._handle_message_event(event)
 
             except asyncio.TimeoutError:
-                # 正常超时，清理已完成的任务并继续循环
                 await self._cleanup_completed_tasks()
+                self._cleanup_old_messages()
                 continue
             except Exception as e:
                 self.logger.error(f"❌ Dispatcher error: {e}")
@@ -370,6 +404,31 @@ class WebSocketServer:
                 self.logger.error(f"   Traceback: {traceback.format_exc()}")
 
         self.logger.info("Event dispatcher stopped")
+
+    def _cleanup_old_messages(self) -> None:
+        now = time.time()
+        expired = [
+            msg_id
+            for msg_id, timestamp in self._processed_messages.items()
+            if now - timestamp > self._message_history_ttl
+        ]
+        for msg_id in expired:
+            del self._processed_messages[msg_id]
+        if expired:
+            self.logger.debug(f"已清理 {len(expired)} 条过期消息记录")
+
+    def _cleanup_old_messages(self) -> None:
+        """清理超过TTL的已处理消息记录"""
+        now = time.time()
+        expired = [
+            msg_id
+            for msg_id, timestamp in self._processed_messages.items()
+            if now - timestamp > self._message_history_ttl
+        ]
+        for msg_id in expired:
+            del self._processed_messages[msg_id]
+        if expired:
+            self.logger.debug(f"已清理 {len(expired)} 条过期消息记录")
 
     async def send_message(self, message: APIMessageBase) -> Dict[str, bool]:
         """发送标准消息
@@ -381,22 +440,24 @@ class WebSocketServer:
             Dict[str, bool]: 连接UUID到发送结果的映射
         """
         results = {}
-        self.logger.info(f"🚀 WebSocketServer 开始发送消息")
+        self.logger.info("🚀 WebSocketServer 开始发送消息")
 
         # 从消息中获取路由信息
         api_key = message.get_api_key()
         platform = message.get_platform()
-        self.logger.info(f"📨 消息路由信息: api_key={api_key}, platform={platform}")
+        self.logger.info(
+            f"📨 消息路由信息: api_key={api_key}, platform={platform}"
+        )
 
         # 使用 extract_user 回调获取用户ID
         try:
-            self.logger.info(f"🔍 开始从消息元数据提取用户ID")
+            self.logger.info("🔍 开始从消息元数据提取用户ID")
             # 构造完整的metadata，包含消息的路由信息
             message_metadata = {
                 "api_key": api_key,
                 "platform": platform,
                 "message_type": "outgoing",
-                "timestamp": time.time()
+                "timestamp": time.time(),
             }
             target_user = await self.config.on_auth_extract_user(message_metadata)
             self.logger.info(f"✅ 成功提取用户ID: {target_user} (从消息)")
@@ -407,16 +468,22 @@ class WebSocketServer:
         # 使用三级映射表获取目标用户的连接
         if target_user not in self.user_connections:
             self.logger.warning(f"❌ 用户 {target_user} 没有连接")
-            self.logger.info(f"📋 可用的用户: {list(self.user_connections.keys())}")
+            self.logger.info(
+                f"📋 可用的用户: {list(self.user_connections.keys())}"
+            )
             return results
 
-        self.logger.info(f"✅ 找到用户 {target_user}，在 {platform} 平台获取其连接")
+        self.logger.info(
+            f"✅ 找到用户 {target_user}，在 {platform} 平台获取其连接"
+        )
 
         # 获取用户在指定平台的所有连接
         user_platform_connections = self.user_connections[target_user]
 
         # 记录当前连接状态
-        self.logger.info(f"📊 当前连接状态: 已注册用户={len(self.user_connections)}, 用户连接映射={list(self.user_connections.keys())}")
+        self.logger.info(
+            f"📊 当前连接状态: 已注册用户={len(self.user_connections)}, 用户连接映射={list(self.user_connections.keys())}"
+        )
 
         # 获取目标平台的连接
         if platform not in user_platform_connections:
@@ -424,10 +491,9 @@ class WebSocketServer:
             return results
         target_connections = user_platform_connections[platform]
 
-        # 构造消息包
         message_package = {
             "ver": 1,
-            "msg_id": f"msg_{int(time.time() * 1000)}",
+            "msg_id": f"msg_{uuid.uuid4().hex[:12]}_{int(time.time())}",
             "type": "sys_std",
             "meta": {
                 "sender_user": "server",
@@ -465,7 +531,7 @@ class WebSocketServer:
         # 构造消息包
         message_package = {
             "ver": 1,
-            "msg_id": f"custom_{int(time.time() * 1000)}",
+            "msg_id": f"custom_{uuid.uuid4().hex[:12]}_{int(time.time())}",
             "type": message_type,
             "meta": {
                 "sender_user": "server",
@@ -501,7 +567,6 @@ class WebSocketServer:
 
         return results
 
-  
     def get_user_connections(self, user_id: str) -> Set[str]:
         """获取用户的所有连接"""
         return self.user_connections.get(user_id, set())
@@ -522,10 +587,7 @@ class WebSocketServer:
         metadata = self.connection_metadata.get(connection_uuid, {})
         platform = metadata.get("platform", "")
 
-        return {
-            "user_id": user_id,
-            "platform": platform
-        }
+        return {"user_id": user_id, "platform": platform}
 
     def get_user_count(self) -> int:
         """获取当前用户数"""
@@ -548,11 +610,27 @@ class WebSocketServer:
 
         self.running = True
 
+        # 初始化消息缓存（如果配置启用）
+        if self.config.enable_message_cache:
+            from .message_cache import MessageCache
+
+            message_cache = MessageCache(
+                enabled=self.config.enable_message_cache,
+                ttl=self.config.message_cache_ttl,
+                max_size=self.config.message_cache_max_size,
+                cleanup_interval=self.config.message_cache_cleanup_interval,
+            )
+            await message_cache.start()
+            self.network_driver.set_message_cache(message_cache)
+            self.logger.info(
+                f"Message cache initialized: TTL={self.config.message_cache_ttl}s, max_size={self.config.message_cache_max_size}"
+            )
+
         # 启动事件分发器
         self.dispatcher_task = asyncio.create_task(self._dispatcher_loop())
 
         # 并行启动网络驱动器
-        network_task = asyncio.create_task(self.network_driver.start(self.event_queue))
+        asyncio.create_task(self.network_driver.start(self.event_queue))
 
         self.logger.info(
             f"WebSocket server starting on {self.network_driver.host}:{self.network_driver.port}"
@@ -561,7 +639,7 @@ class WebSocketServer:
         # 等待网络驱动器启动
         await asyncio.sleep(1)
 
-        self.logger.info(f"WebSocket server started successfully")
+        self.logger.info("WebSocket server started successfully")
 
     async def stop(self) -> None:
         """停止服务端 - 完全清理所有协程"""
@@ -585,7 +663,9 @@ class WebSocketServer:
 
         # 3. 取消并等待所有handler任务完成
         if self.active_handler_tasks:
-            self.logger.info(f"正在清理 {len(self.active_handler_tasks)} 个handler任务...")
+            self.logger.info(
+                f"正在清理 {len(self.active_handler_tasks)} 个handler任务..."
+            )
             for task in self.active_handler_tasks:
                 if not task.done():
                     task.cancel()
@@ -594,8 +674,10 @@ class WebSocketServer:
             if self.active_handler_tasks:
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(*self.active_handler_tasks, return_exceptions=True),
-                        timeout=3.0
+                        asyncio.gather(
+                            *self.active_handler_tasks, return_exceptions=True
+                        ),
+                        timeout=3.0,
                     )
                 except asyncio.TimeoutError:
                     self.logger.warning("部分handler任务清理超时")
@@ -614,7 +696,7 @@ class WebSocketServer:
         self.user_connections.clear()
         self.platform_connections.clear()
         self.connection_users.clear()
-        if hasattr(self, 'custom_handlers'):
+        if hasattr(self, "custom_handlers"):
             self.custom_handlers.clear()
 
         self.logger.info("WebSocket server stopped completely")
@@ -632,7 +714,7 @@ class WebSocketServer:
             "event_queue_size": 0,
             "active_connections": 0,
             "registered_users": len(self.user_connections),
-            "custom_handlers": len(getattr(self, 'custom_handlers', {}))
+            "custom_handlers": len(getattr(self, "custom_handlers", {})),
         }
 
         # 检查事件分发器状态
@@ -640,20 +722,26 @@ class WebSocketServer:
             status["dispatcher_task"] = {
                 "exists": True,
                 "done": self.dispatcher_task.done(),
-                "cancelled": self.dispatcher_task.cancelled() if hasattr(self.dispatcher_task, 'cancelled') else False
+                "cancelled": self.dispatcher_task.cancelled()
+                if hasattr(self.dispatcher_task, "cancelled")
+                else False,
             }
 
         # 检查网络驱动器状态
-        status["network_driver_running"] = self.network_driver.running if hasattr(self.network_driver, 'running') else False
+        status["network_driver_running"] = (
+            self.network_driver.running
+            if hasattr(self.network_driver, "running")
+            else False
+        )
 
         # 检查事件队列大小
         try:
             status["event_queue_size"] = self.event_queue.qsize()
-        except:
+        except AttributeError:
             pass
 
         # 检查活跃连接数
-        if hasattr(self.network_driver, 'active_connections'):
+        if hasattr(self.network_driver, "active_connections"):
             status["active_connections"] = len(self.network_driver.active_connections)
 
         return status

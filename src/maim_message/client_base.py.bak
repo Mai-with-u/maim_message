@@ -10,6 +10,8 @@ from typing import Any, Callable, Dict, Optional, Set
 from .client_ws_connection import ClientNetworkDriver, EventType, NetworkEvent
 from .ws_config import ClientConfig
 
+logger = logging.getLogger(__name__)
+
 
 class WebSocketClientBase(ABC):
     """WebSocket 客户端基类 - 提供通用的客户端功能
@@ -21,10 +23,7 @@ class WebSocketClientBase(ABC):
         self.default_config = default_config
 
         custom_logger = default_config.get_logger() if default_config else None
-        if not hasattr(self, "logger"):
-            self.logger = (
-                custom_logger if custom_logger else logging.getLogger(__name__)
-            )
+        self.logger = custom_logger if custom_logger else logging.getLogger(__name__)
 
         self.network_driver = ClientNetworkDriver(custom_logger=custom_logger)
 
@@ -59,14 +58,14 @@ class WebSocketClientBase(ABC):
         if not message_type.startswith("custom_"):
             message_type = f"custom_{message_type}"
         self.custom_handlers[message_type] = handler
-        self.logger.info(f"注册自定义处理器: {message_type}")
+        logger.info(f"注册自定义处理器: {message_type}")
 
     def unregister_custom_handler(self, message_type: str) -> None:
         """注销自定义消息处理器"""
         if not message_type.startswith("custom_"):
             message_type = f"custom_{message_type}"
         self.custom_handlers.pop(message_type, None)
-        self.logger.info(f"注销自定义处理器: {message_type}")
+        logger.info(f"注销自定义处理器: {message_type}")
 
     async def _cleanup_completed_tasks(self) -> None:
         """清理已完成的handler任务"""
@@ -79,7 +78,7 @@ class WebSocketClientBase(ABC):
             try:
                 await task
             except Exception as e:
-                self.logger.error(f"Handler task异常: {e}")
+                logger.error(f"Handler task异常: {e}")
 
     async def _create_handler_task(self, coro, description: str = "handler") -> None:
         """创建并管理handler任务"""
@@ -90,16 +89,14 @@ class WebSocketClientBase(ABC):
         async def task_wrapper():
             try:
                 await coro
-                self.logger.debug(
-                    f"✅ Client handler task {task_id} ({description}) 完成"
-                )
+                logger.debug(f"✅ Client handler task {task_id} ({description}) 完成")
             except Exception as e:
-                self.logger.error(
+                logger.error(
                     f"❌ Client handler task {task_id} ({description}) 异常: {e}"
                 )
                 import traceback
 
-                self.logger.error(f"   Traceback: {traceback.format_exc()}")
+                logger.error(f"   Traceback: {traceback.format_exc()}")
             finally:
                 # 任务完成后自动清理
                 if task in self.active_handler_tasks:
@@ -110,7 +107,7 @@ class WebSocketClientBase(ABC):
         self.active_handler_tasks.add(task)
         self.stats["active_handler_tasks"] = len(self.active_handler_tasks)
 
-        self.logger.debug(
+        logger.debug(
             f"🚀 Client handler task {task_id} ({description}) 已创建，当前活跃任务数: {len(self.active_handler_tasks)}"
         )
 
@@ -127,7 +124,7 @@ class WebSocketClientBase(ABC):
                         # 子类可以重写这个方法来处理标准消息
                         await self._handle_standard_message(payload)
                     except Exception as e:
-                        self.logger.error(f"处理标准消息时出错: {e}")
+                        logger.error(f"处理标准消息时出错: {e}")
 
             # 处理自定义消息
             elif payload.get("type", "").startswith("custom_"):
@@ -142,14 +139,14 @@ class WebSocketClientBase(ABC):
                             f"客户端自定义消息处理器-{message_type}",
                         )
                     except Exception as e:
-                        self.logger.error(
+                        logger.error(
                             f"创建自定义消息处理器任务错误 {message_type}: {e}"
                         )
                 else:
-                    self.logger.warning(f"未找到自定义消息处理器: {message_type}")
+                    logger.warning(f"未找到自定义消息处理器: {message_type}")
 
         except Exception as e:
-            self.logger.error(f"处理消息事件时出错: {e}")
+            logger.error(f"处理消息事件时出错: {e}")
 
     async def _handle_standard_message(self, payload: Dict[str, Any]) -> None:
         """处理标准消息 - 子类可以重写此方法"""
@@ -166,7 +163,7 @@ class WebSocketClientBase(ABC):
 
     async def _event_dispatcher(self) -> None:
         """事件分发器"""
-        self.logger.info(f"{self.__class__.__name__} event dispatcher started")
+        logger.info(f"{self.__class__.__name__} event dispatcher started")
         try:
             while self.running:
                 try:
@@ -185,12 +182,12 @@ class WebSocketClientBase(ABC):
                     await self._cleanup_completed_tasks()
                     continue
                 except Exception as e:
-                    self.logger.error(f"Dispatcher error: {e}")
+                    logger.error(f"Dispatcher error: {e}")
 
         except Exception as e:
-            self.logger.error(f"Event dispatcher crashed: {e}")
+            logger.error(f"Event dispatcher crashed: {e}")
 
-        self.logger.info(f"{self.__class__.__name__} event dispatcher stopped")
+        logger.info(f"{self.__class__.__name__} event dispatcher stopped")
 
     @abstractmethod
     async def _handle_connect_event(self, event: NetworkEvent) -> None:
@@ -205,7 +202,7 @@ class WebSocketClientBase(ABC):
     async def start(self) -> None:
         """启动客户端"""
         if self.running:
-            self.logger.warning(f"{self.__class__.__name__} is already running")
+            logger.warning(f"{self.__class__.__name__} is already running")
             return
 
         self.running = True
@@ -223,7 +220,7 @@ class WebSocketClientBase(ABC):
             )
             await message_cache.start()
             self.network_driver.set_message_cache(message_cache)
-            self.logger.info(
+            logger.info(
                 f"Message cache initialized: TTL={self.default_config.message_cache_ttl}s, max_size={self.default_config.message_cache_max_size}"
             )
 
@@ -232,14 +229,14 @@ class WebSocketClientBase(ABC):
 
         # 启动事件分发器
         self.dispatcher_task = asyncio.create_task(self._event_dispatcher())
-        self.logger.info(f"{self.__class__.__name__} started")
+        logger.info(f"{self.__class__.__name__} started")
 
     async def stop(self) -> None:
         """停止客户端 - 完全清理所有协程"""
         if not self.running:
             return
 
-        self.logger.info(f"Stopping {self.__class__.__name__}...")
+        logger.info(f"Stopping {self.__class__.__name__}...")
 
         # 1. 首先停止运行状态
         self.running = False
@@ -258,7 +255,7 @@ class WebSocketClientBase(ABC):
 
         # 4. 取消并等待所有handler任务完成
         if self.active_handler_tasks:
-            self.logger.info(
+            logger.info(
                 f"正在清理 {len(self.active_handler_tasks)} 个客户端handler任务..."
             )
             for task in self.active_handler_tasks:
@@ -275,7 +272,7 @@ class WebSocketClientBase(ABC):
                         timeout=3.0,
                     )
                 except asyncio.TimeoutError:
-                    self.logger.warning("部分客户端handler任务清理超时")
+                    logger.warning("部分客户端handler任务清理超时")
 
             self.active_handler_tasks.clear()
             self.stats["active_handler_tasks"] = 0
@@ -296,7 +293,7 @@ class WebSocketClientBase(ABC):
             "custom_messages_processed": 0,
         }
 
-        self.logger.info(f"{self.__class__.__name__} stopped completely")
+        logger.info(f"{self.__class__.__name__} stopped completely")
 
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""

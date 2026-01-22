@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Callable, Dict, Optional, Set
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 
-from .message import APIMessageBase, BaseMessageInfo, Seg, MessageDim
+from .message import APIMessageBase
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +38,9 @@ class ServerConfig(ConfigValidator):
     # SSL/TLS配置
     ssl_enabled: bool = False
     ssl_certfile: Optional[str] = None  # SSL证书文件路径
-    ssl_keyfile: Optional[str] = None   # SSL私钥文件路径
+    ssl_keyfile: Optional[str] = None  # SSL私钥文件路径
     ssl_ca_certs: Optional[str] = None  # CA证书文件路径（可选）
-    ssl_verify: bool = False             # 是否验证客户端证书
+    ssl_verify: bool = False  # 是否验证客户端证书
 
     # 回调函数配置
     on_auth: Optional[Callable[[Dict[str, Any]], bool]] = None
@@ -49,7 +48,9 @@ class ServerConfig(ConfigValidator):
     on_message: Optional[Callable[[APIMessageBase, Dict[str, Any]], None]] = None
 
     # 自定义消息处理器
-    custom_handlers: Dict[str, Callable[[Dict[str, Any]], None]] = field(default_factory=dict)
+    custom_handlers: Dict[str, Callable[[Dict[str, Any]], None]] = field(
+        default_factory=dict
+    )
 
     # 统计信息配置
     enable_stats: bool = True
@@ -59,7 +60,13 @@ class ServerConfig(ConfigValidator):
     log_level: str = "INFO"
     enable_connection_log: bool = True
     enable_message_log: bool = True
-    custom_logger: Optional[Any] = None  # 自定义logger，支持任意有info/debug/error/warning方法的logger对象
+    custom_logger: Optional[Any] = field(default=None)
+
+    # 消息缓存配置（API模式ACK机制支持）
+    enable_message_cache: bool = True
+    message_cache_ttl: int = 300
+    message_cache_max_size: int = 1000
+    message_cache_cleanup_interval: float = 60.0
 
     def validate(self) -> bool:
         """验证配置是否有效"""
@@ -84,34 +91,46 @@ class ServerConfig(ConfigValidator):
             return self.custom_logger
         # 返回标准logging logger
         import logging
+
         return logging.getLogger(__name__)
 
     def get_default_auth_handler(self) -> Callable[[Dict[str, Any]], bool]:
         """获取默认认证处理器"""
+
         async def default_auth(metadata: Dict[str, Any]) -> bool:
             """默认认证：总是通过，无需API Key验证"""
             logger.info("默认认证通过：无需API Key验证")
             return True
+
         return default_auth
 
     def get_default_user_extractor(self) -> Callable[[Dict[str, Any]], str]:
         """获取默认用户标识提取器"""
+
         async def default_extract_user(metadata: Dict[str, Any]) -> str:
             """默认用户标识提取：所有用户都使用默认用户标识"""
             logger.debug("默认用户标识提取：使用系统默认用户")
             return "sys_default"
+
         return default_extract_user
 
-    def get_default_message_handler(self) -> Callable[[APIMessageBase, Dict[str, Any]], None]:
+    def get_default_message_handler(
+        self,
+    ) -> Callable[[APIMessageBase, Dict[str, Any]], None]:
         """获取默认消息处理器"""
-        async def default_message_handler(message: APIMessageBase, metadata: Dict[str, Any]) -> None:
+
+        async def default_message_handler(
+            message: APIMessageBase, metadata: Dict[str, Any]
+        ) -> None:
             """默认消息处理器：记录消息"""
             if self.enable_message_log:
-                logger.info(f"收到消息: {message.message_segment.data} "
-                           f"from {message.get_api_key()}")
+                logger.info(
+                    f"收到消息: {message.message_segment.data} "
+                    f"from {message.get_api_key()}"
+                )
+
         return default_message_handler
 
-    
     def ensure_defaults(self) -> None:
         """确保所有必填的回调都有默认值"""
         if self.on_auth is None:
@@ -126,7 +145,9 @@ class ServerConfig(ConfigValidator):
             self.on_message = self.get_default_message_handler()
             logger.info("使用默认消息处理器")
 
-    def register_custom_handler(self, message_type: str, handler: Callable[[Dict[str, Any]], None]) -> None:
+    def register_custom_handler(
+        self, message_type: str, handler: Callable[[Dict[str, Any]], None]
+    ) -> None:
         """注册自定义消息处理器"""
         if not message_type.startswith("custom_"):
             message_type = f"custom_{message_type}"
@@ -152,16 +173,16 @@ class ClientConfig(ConfigValidator):
     connection_uuid: Optional[str] = None
 
     # SSL/TLS配置
-    ssl_enabled: bool = False                    # 是否启用SSL
-    ssl_verify: bool = True                     # 是否验证SSL证书
-    ssl_ca_certs: Optional[str] = None         # CA证书文件路径
-    ssl_certfile: Optional[str] = None         # 客户端证书文件路径
-    ssl_keyfile: Optional[str] = None          # 客户端私钥文件路径
-    ssl_check_hostname: bool = True             # 是否检查主机名
+    ssl_enabled: bool = False  # 是否启用SSL
+    ssl_verify: bool = True  # 是否验证SSL证书
+    ssl_ca_certs: Optional[str] = None  # CA证书文件路径
+    ssl_certfile: Optional[str] = None  # 客户端证书文件路径
+    ssl_keyfile: Optional[str] = None  # 客户端私钥文件路径
+    ssl_check_hostname: bool = True  # 是否检查主机名
 
     # 重连配置
     auto_reconnect: bool = True
-    max_reconnect_attempts: int = 5
+    max_reconnect_attempts: int = 0
     reconnect_delay: float = 2.0
     max_reconnect_delay: float = 10.0
 
@@ -174,7 +195,9 @@ class ClientConfig(ConfigValidator):
     on_message: Optional[Callable[[APIMessageBase, Dict[str, Any]], None]] = None
 
     # 自定义消息处理器
-    custom_handlers: Dict[str, Callable[[Dict[str, Any]], None]] = field(default_factory=dict)
+    custom_handlers: Dict[str, Callable[[Dict[str, Any]], None]] = field(
+        default_factory=dict
+    )
 
     # 统计信息配置
     enable_stats: bool = True
@@ -184,7 +207,13 @@ class ClientConfig(ConfigValidator):
     log_level: str = "INFO"
     enable_connection_log: bool = True
     enable_message_log: bool = True
-    custom_logger: Optional[Any] = None  # 自定义logger，支持任意有info/debug/error/warning方法的logger对象
+    custom_logger: Optional[Any] = field(default=None)
+
+    # 消息缓存配置（API模式ACK机制支持）
+    enable_message_cache: bool = True
+    message_cache_ttl: int = 300
+    message_cache_max_size: int = 1000
+    message_cache_cleanup_interval: float = 60.0
 
     # HTTP Headers
     headers: Dict[str, str] = field(default_factory=dict)
@@ -195,6 +224,7 @@ class ClientConfig(ConfigValidator):
             return self.custom_logger
         # 返回标准logging logger
         import logging
+
         return logging.getLogger(__name__)
 
     def validate(self) -> bool:
@@ -222,13 +252,18 @@ class ClientConfig(ConfigValidator):
 
         return missing
 
-    
-    def get_default_message_handler(self) -> Callable[[APIMessageBase, Dict[str, Any]], None]:
+    def get_default_message_handler(
+        self,
+    ) -> Callable[[APIMessageBase, Dict[str, Any]], None]:
         """获取默认消息处理器"""
-        async def default_message_handler(message: APIMessageBase, metadata: Dict[str, Any]) -> None:
+
+        async def default_message_handler(
+            message: APIMessageBase, metadata: Dict[str, Any]
+        ) -> None:
             """默认消息处理器：记录消息"""
             if self.enable_message_log:
                 logger.info(f"收到消息: {message.message_segment.data}")
+
         return default_message_handler
 
     def ensure_defaults(self) -> None:
@@ -238,15 +273,14 @@ class ClientConfig(ConfigValidator):
             logger.info("使用默认消息处理器")
 
         # 设置默认headers
-        default_headers = {
-            "x-apikey": self.api_key,
-            "x-platform": self.platform
-        }
+        default_headers = {"x-apikey": self.api_key, "x-platform": self.platform}
         for key, value in default_headers.items():
             if key not in self.headers:
                 self.headers[key] = value
 
-    def register_custom_handler(self, message_type: str, handler: Callable[[Dict[str, Any]], None]) -> None:
+    def register_custom_handler(
+        self, message_type: str, handler: Callable[[Dict[str, Any]], None]
+    ) -> None:
         """注册自定义消息处理器"""
         if not message_type.startswith("custom_"):
             message_type = f"custom_{message_type}"
@@ -264,6 +298,7 @@ class ClientConfig(ConfigValidator):
 @dataclass
 class AuthResult:
     """认证结果"""
+
     success: bool
     user_id: Optional[str] = None
     error_message: Optional[str] = None
@@ -468,7 +503,7 @@ def create_ssl_server_config(
     port: int = 18044,
     ssl_certfile: str = None,
     ssl_keyfile: str = None,
-    **kwargs
+    **kwargs,
 ) -> ServerConfig:
     """创建SSL服务端配置的便捷函数
 
@@ -495,13 +530,15 @@ def create_ssl_server_config(
             on_auth_extract_user=lambda metadata: metadata["api_key"]
         )
     """
-    kwargs.update({
-        "host": host,
-        "port": port,
-        "ssl_enabled": True,
-        "ssl_certfile": ssl_certfile,
-        "ssl_keyfile": ssl_keyfile
-    })
+    kwargs.update(
+        {
+            "host": host,
+            "port": port,
+            "ssl_enabled": True,
+            "ssl_certfile": ssl_certfile,
+            "ssl_keyfile": ssl_keyfile,
+        }
+    )
     return create_server_config(**kwargs)
 
 
@@ -512,7 +549,7 @@ def create_ssl_client_config(
     api_key: str = None,
     path: str = "/ws",
     ssl_ca_certs: str = None,
-    **kwargs
+    **kwargs,
 ) -> ClientConfig:
     """创建SSL客户端配置的便捷函数
 
@@ -563,10 +600,7 @@ def create_ssl_client_config(
     if url is None:
         url = f"wss://{host}:{port}{path}"
 
-    kwargs.update({
-        "ssl_enabled": True,
-        "ssl_ca_certs": ssl_ca_certs
-    })
+    kwargs.update({"ssl_enabled": True, "ssl_ca_certs": ssl_ca_certs})
 
     if api_key is not None:
         return create_client_config(url, api_key, **kwargs)
@@ -615,8 +649,6 @@ class ConnectionEntry:
 
 @dataclass
 class MultiClientConfig(ConfigValidator):
-    """WebSocket 多连接客户端配置类"""
-
     # 连接配置
     connections: Dict[str, ConnectionEntry] = field(default_factory=dict)
 
@@ -624,11 +656,13 @@ class MultiClientConfig(ConfigValidator):
     on_message: Optional[Callable[[APIMessageBase, Dict[str, Any]], None]] = None
 
     # 自定义消息处理器
-    custom_handlers: Dict[str, Callable[[Dict[str, Any]], None]] = field(default_factory=dict)
+    custom_handlers: Dict[str, Callable[[Dict[str, Any]], None]] = field(
+        default_factory=dict
+    )
 
     # 全局设置
-    auto_connect_on_start: bool = False  # 启动时是否自动连接所有注册的连接
-    connect_timeout: float = 10.0        # 连接超时时间
+    auto_connect_on_start: bool = False
+    connect_timeout: float = 10.0
 
     # 统计信息配置
     enable_stats: bool = True
@@ -638,6 +672,16 @@ class MultiClientConfig(ConfigValidator):
     log_level: str = "INFO"
     enable_connection_log: bool = True
     enable_message_log: bool = True
+    custom_logger: Optional[Any] = field(default=None)
+
+    def get_logger(self):
+        """获取配置的logger，如果设置了custom_logger则使用它，否则使用默认logger"""
+        if self.custom_logger is not None:
+            return self.custom_logger
+        # 返回标准logging logger
+        import logging
+
+        return logging.getLogger(__name__)
 
     def validate(self) -> bool:
         """验证配置是否有效"""
@@ -664,7 +708,9 @@ class MultiClientConfig(ConfigValidator):
         """获取缺失的必填字段"""
         return set()  # 多连接配置没有全局必填字段
 
-    def register_connection(self, name: str, url: str, api_key: str, platform: str = "default", **kwargs) -> None:
+    def register_connection(
+        self, name: str, url: str, api_key: str, platform: str = "default", **kwargs
+    ) -> None:
         """注册连接配置（一步配置后继续添加）
 
         Args:
@@ -675,16 +721,14 @@ class MultiClientConfig(ConfigValidator):
             **kwargs: 其他连接参数
         """
         connection = ConnectionEntry(
-            name=name,
-            url=url,
-            api_key=api_key,
-            platform=platform,
-            **kwargs
+            name=name, url=url, api_key=api_key, platform=platform, **kwargs
         )
         self.connections[name] = connection
         logger.info(f"注册连接配置: {name} -> {url} (platform: {platform})")
 
-    def add_connection(self, name: str, url: str, api_key: str, platform: str = "default", **kwargs) -> None:
+    def add_connection(
+        self, name: str, url: str, api_key: str, platform: str = "default", **kwargs
+    ) -> None:
         """添加连接配置（兼容方法，调用register_connection）"""
         self.register_connection(name, url, api_key, platform, **kwargs)
 
@@ -706,7 +750,9 @@ class MultiClientConfig(ConfigValidator):
         """列出所有连接配置"""
         return self.connections.copy()
 
-    def register_custom_handler(self, message_type: str, handler: Callable[[Dict[str, Any]], None]) -> None:
+    def register_custom_handler(
+        self, message_type: str, handler: Callable[[Dict[str, Any]], None]
+    ) -> None:
         """注册自定义消息处理器"""
         if not message_type.startswith("custom_"):
             message_type = f"custom_{message_type}"
@@ -726,39 +772,53 @@ class MultiClientConfig(ConfigValidator):
             self.on_message = self.get_default_message_handler()
             logger.info("使用默认消息处理器")
 
-    def get_default_message_handler(self) -> Callable[[APIMessageBase, Dict[str, Any]], None]:
+    def get_default_message_handler(
+        self,
+    ) -> Callable[[APIMessageBase, Dict[str, Any]], None]:
         """获取默认消息处理器"""
-        async def default_message_handler(message: APIMessageBase, metadata: Dict[str, Any]) -> None:
+
+        async def default_message_handler(
+            message: APIMessageBase, metadata: Dict[str, Any]
+        ) -> None:
             """默认消息处理器：记录消息"""
             if self.enable_message_log:
                 logger.info(f"收到消息: {message.message_segment.data}")
+
         return default_message_handler
 
-    def register_ssl_connection(self, name: str, url: str, api_key: str, platform: str = "default",
-                            ssl_ca_certs: Optional[str] = None, **kwargs) -> None:
+    def register_ssl_connection(
+        self,
+        name: str,
+        url: str,
+        api_key: str,
+        platform: str = "default",
+        ssl_ca_certs: Optional[str] = None,
+        **kwargs,
+    ) -> None:
         """注册SSL连接配置的便捷方法"""
         if url.startswith("wss://"):
-            ssl_kwargs = {
-                "ssl_enabled": True,
-                "ssl_ca_certs": ssl_ca_certs,
-                **kwargs
-            }
+            ssl_kwargs = {"ssl_enabled": True, "ssl_ca_certs": ssl_ca_certs, **kwargs}
         else:
             # 自动转换为wss协议
             url = url.replace("ws://", "wss://")
-            ssl_kwargs = {
-                "ssl_enabled": True,
-                "ssl_ca_certs": ssl_ca_certs,
-                **kwargs
-            }
+            ssl_kwargs = {"ssl_enabled": True, "ssl_ca_certs": ssl_ca_certs, **kwargs}
 
         self.register_connection(name, url, api_key, platform, **ssl_kwargs)
         logger.info(f"注册SSL连接配置: {name} -> {url}")
 
-    def add_ssl_connection(self, name: str, url: str, api_key: str, platform: str = "default",
-                          ssl_ca_certs: Optional[str] = None, **kwargs) -> None:
+    def add_ssl_connection(
+        self,
+        name: str,
+        url: str,
+        api_key: str,
+        platform: str = "default",
+        ssl_ca_certs: Optional[str] = None,
+        **kwargs,
+    ) -> None:
         """添加SSL连接配置（兼容方法，调用register_ssl_connection）"""
-        self.register_ssl_connection(name, url, api_key, platform, ssl_ca_certs, **kwargs)
+        self.register_ssl_connection(
+            name, url, api_key, platform, ssl_ca_certs, **kwargs
+        )
 
 
 # 便捷函数
@@ -803,8 +863,7 @@ def create_multi_client_config(**kwargs) -> MultiClientConfig:
 
 
 def create_multi_client_config_with_connections(
-    connections: Dict[str, Dict[str, Any]],
-    **kwargs
+    connections: Dict[str, Dict[str, Any]], **kwargs
 ) -> MultiClientConfig:
     """创建多连接客户端配置并批量添加连接的便捷函数
 
