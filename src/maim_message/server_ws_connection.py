@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import threading
 import time
 import uuid
@@ -72,7 +73,7 @@ class NetworkEvent:
 
 
 class ServerNetworkDriver:
-    """服务端网络驱动器 - 纯I/O层，负责WebSocket连接管理"""
+    """服务端网络驱动器 - 线I/O层，负责WebSocket连接管理"""
 
     def __init__(
         self,
@@ -97,10 +98,22 @@ class ServerNetworkDriver:
         self.ssl_ca_certs = ssl_ca_certs
         self.ssl_verify = ssl_verify
 
+        print(
+            f"[ServerNetworkDriver DEBUG] custom_logger type: {type(custom_logger)}, value: {custom_logger}",
+            file=sys.stderr,
+        )
         if custom_logger is not None:
             self.logger = custom_logger
+            print(
+                f"[ServerNetworkDriver DEBUG] Using custom logger: {custom_logger}",
+                file=sys.stderr,
+            )
         else:
             self.logger = logger
+            print(
+                f"[ServerNetworkDriver DEBUG] Using default logger: {logger}",
+                file=sys.stderr,
+            )
 
         # 连接管理
         self.active_connections: Dict[str, WebSocket] = {}
@@ -137,13 +150,54 @@ class ServerNetworkDriver:
     def _setup_routes(self) -> None:
         """设置WebSocket路由"""
 
+        # 添加中间件来记录所有请求
+        @self.app.middleware("http")
+        async def log_requests(request, call_next):
+            headers = dict(request.headers)
+            print(
+                f"[DEBUG MIDDLEWARE] Request received: {request.method} {request.url.path} {request.url.query}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                f"[DEBUG MIDDLEWARE] Headers: {headers}",
+                file=sys.stderr,
+                flush=True,
+            )
+            logger.info(
+                f"[DEBUG MIDDLEWARE] Request: {request.method} {request.url.path}?{request.url.query}"
+            )
+            logger.info(f"[DEBUG MIDDLEWARE] Headers: {headers}")
+            response = await call_next(request)
+            return response
+
         @self.app.websocket(self.path)
         async def websocket_endpoint(
             websocket: WebSocket, api_key: str = None, platform: str = None
         ):
-            await self._handle_connection(
-                websocket, query_api_key=api_key, query_platform=platform
+            print(
+                f"[DEBUG WEBSOCKET] websocket_endpoint called! path={self.path}, api_key={api_key}",
+                file=sys.stderr,
+                flush=True,
             )
+            logger.info(
+                f"[DEBUG] websocket_endpoint called! path={self.path}, api_key={api_key}, platform={platform}"
+            )
+            try:
+                await self._handle_connection(
+                    websocket, query_api_key=api_key, query_platform=platform
+                )
+            except Exception as e:
+                logger.error(
+                    f"[ERROR] websocket_endpoint exception: {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                print(
+                    f"[ERROR WEBSOCKET] websocket_endpoint exception: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
 
     async def _handle_connection(
         self,
@@ -154,12 +208,14 @@ class ServerNetworkDriver:
         """处理WebSocket连接的完整生命周期"""
         # 1. 接受连接
         await websocket.accept()
+        logger.info(f"[DEBUG] Connection accepted in _handle_connection")
 
         # 2. 提取连接元数据
         metadata = self._extract_metadata(
             websocket, query_api_key=query_api_key, query_platform=query_platform
         )
         connection_uuid = metadata.uuid
+        logger.info(f"[DEBUG] Connection UUID: {connection_uuid}")
 
         logger.info(f"New connection from {metadata.client_ip}: {connection_uuid}")
 
@@ -344,7 +400,22 @@ class ServerNetworkDriver:
 
             # 直接发送事件到队列（同一线程）
             if self.event_queue:
+                logger.info(
+                    f"[DEBUG] Putting event to queue: {event_type.value} for {connection_uuid}"
+                )
+                print(
+                    f"[DEBUG] Putting event to queue: {event_type.value} for {connection_uuid}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 await self.event_queue.put(event)
+                queue_size = self.event_queue.qsize()
+                logger.info(f"[DEBUG] Event put successfully, queue size: {queue_size}")
+                print(
+                    f"[DEBUG] Event put successfully, queue size: {queue_size}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 logger.debug(
                     f"✅ Event {event_type.value} for {connection_uuid} sent successfully"
                 )
@@ -561,6 +632,14 @@ class ServerNetworkDriver:
 
             config = uvicorn.Config(**uvicorn_kwargs)
 
+            # Debug: Check routes
+            logger.info(
+                f"[DEBUG] ServerNetworkDriver app routes: {[route.path for route in self.app.routes]}"
+            )
+            logger.info(
+                f"[DEBUG] ServerNetworkDriver host={self.host}, port={self.port}, path={self.path}"
+            )
+
             # 启动服务器
             self._uvicorn_server = uvicorn.Server(config)
             self.running = True
@@ -594,12 +673,28 @@ class ServerNetworkDriver:
 
     async def start(self, event_queue: asyncio.Queue) -> None:
         """启动网络驱动器"""
+        print(
+            f"[DEBUG SERVER_NETWORK_DRIVER] start() called. self.running={self.running}, host={self.host}, port={self.port}",
+            file=sys.stderr,
+            flush=True,
+        )
+
         if self.running:
-            logger.warning("Network driver already running")
+            logger.warning(f"Network driver already running on {self.host}:{self.port}")
+            print(
+                f"[DEBUG SERVER_NETWORK_DRIVER] start() returning early - already running",
+                file=sys.stderr,
+                flush=True,
+            )
             return
 
         # 在主事件循环中启动服务器
         logger.info(f"Starting network driver on {self.host}:{self.port}{self.path}")
+        print(
+            f"[DEBUG SERVER_NETWORK_DRIVER] Calling _server_loop_run",
+            file=sys.stderr,
+            flush=True,
+        )
         await self._server_loop_run(event_queue)
 
     async def stop(self) -> None:

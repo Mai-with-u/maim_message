@@ -1,0 +1,28 @@
+[server]
+# WebSocket 服务器配置
+host = "127.0.0.1"
+port = 3000
+token = ""  # 留空表示不启用 token 认证
+
+[messages]
+# 消息生成配置
+delay = 2.0  # 消息发送间隔（秒）
+count = 10  # 测试消息数量（0 表示无限）
+auto_send = true  # 是否自动发送消息
+random_delay = true  # 是否使用随机延迟
+
+[messages.types]
+# 启用的消息类型
+enable_message = true  # 私聊/群聊消息
+enable_notice = true  # 通知消息
+enable_meta_event = true  # 元事件
+
+[user]
+# 模拟的用户信息
+self_id = 1234567890  # 机器人 QQ 号
+group_id = 987654321  # 群号
+user_id = 1111111111  # 用户 QQ 号
+
+[log]
+# 日志配置
+level = "INFO"  # 日志级别: DEBUG, INFO, WARNING, ERROR

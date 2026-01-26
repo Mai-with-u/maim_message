@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import threading
 import time
 import uuid
@@ -16,6 +17,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 
 from .message_cache import MessageCache
+from .log_queue import LoggerProxy, LogQueueProcessor, LogMessage, create_log_queue
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +114,15 @@ class ClientNetworkDriver:
         # 连接管理
         self.connections: Dict[str, ConnectionConfig] = {}
         self.active_connections: Dict[str, websockets.WebSocketServerProtocol] = {}
-        self.connection_states: Dict[
-            str, str
-        ] = {}  # "connecting", "connected", "disconnected", "error"
+        self.connection_states: Dict[str, str] = {}
+
+        self._log_queue: Optional[queue.Queue[LogMessage]] = None
+        self._log_processor: Optional[LogQueueProcessor] = None
+        self._real_logger: Optional[Any] = None
+        self._using_log_proxy = False
 
         if custom_logger is not None:
+            self._real_logger = custom_logger
             self.logger = custom_logger
         else:
             self.logger = logger
@@ -148,6 +154,25 @@ class ClientNetworkDriver:
 
         # 消息缓存支持
         self.message_cache: Optional[MessageCache] = None
+
+    def _init_log_queue(self) -> None:
+        if self._log_queue is not None:
+            return
+
+        self._log_queue = create_log_queue(maxsize=1000)
+
+        if self._real_logger is not None:
+            self._log_processor = LogQueueProcessor(
+                log_queue=self._log_queue,
+                real_logger=self._real_logger,
+                batch_size=10,
+                batch_timeout=0.1,
+            )
+            self.logger = LoggerProxy(
+                log_queue=self._log_queue,
+                logger_name="ClientNetworkDriver",
+            )
+            self._using_log_proxy = True
 
     async def add_connection(self, config: ConnectionConfig) -> bool:
         """添加新的连接配置"""
@@ -845,20 +870,22 @@ class ClientNetworkDriver:
 
         self._shutdown_event.clear()
 
-        # 设置事件队列
+        self._init_log_queue()
+
+        if self._log_processor:
+            await self._log_processor.start()
+
         if event_queue:
             self.event_queue = event_queue
 
         if not self.event_queue:
             raise ValueError("Event queue is required")
 
-        # 启动工作线程
         self.worker_thread = threading.Thread(
             target=self._worker_loop_run, args=(self.event_queue,), daemon=True
         )
         self.worker_thread.start()
 
-        # 等待工作线程启动
         await asyncio.sleep(0.5)
 
         logger.info("Client network driver started")
@@ -909,33 +936,30 @@ class ClientNetworkDriver:
 
         logger.info("Stopping client network driver...")
 
-        # 1. 发送关闭信号
         self._shutdown_event.set()
         self.running = False
 
-        # 2. 在工作线程中执行清理
-        # 关键修复：必须在拥有这些 Task 的 loop 中执行 cancel/await
+        if self._log_processor:
+            await self._log_processor.stop()
+            self._log_processor = None
+
         if self.main_loop and self.main_loop.is_running():
             try:
                 cleanup_future = asyncio.run_coroutine_threadsafe(
                     self._cleanup_worker_tasks(), self.main_loop
                 )
-                # 等待清理完成，设置合理的超时
                 cleanup_future.result(timeout=3.0)
             except Exception as e:
                 logger.warning(f"Error during worker cleanup dispatch: {e}")
 
-        # 3. 等待工作线程结束
         if self.worker_thread and self.worker_thread.is_alive():
             try:
-                # 给线程一点时间自己退出
                 self.worker_thread.join(timeout=3.0)
                 if self.worker_thread.is_alive():
                     logger.warning("Worker thread did not stop gracefully")
             except Exception as e:
                 logger.error(f"Error joining worker thread: {e}")
 
-        # 5. 重置统计信息
         self.stats = {
             "total_connections": 0,
             "current_connections": 0,
@@ -946,8 +970,8 @@ class ClientNetworkDriver:
             "reconnect_attempts": 0,
         }
 
-        # 重置引用
         self.main_loop = None
         self.worker_thread = None
+        self._log_queue = None
 
         logger.info("Client network driver stopped completely")
