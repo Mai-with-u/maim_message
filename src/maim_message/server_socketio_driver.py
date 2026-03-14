@@ -160,7 +160,10 @@ class ServerNetworkDriver:
             headers = {}
             for key, value in environ.items():
                 if key.startswith("HTTP_"):
-                    headers[key[5:].lower()] = value
+                    # CGI converts hyphens to underscores, so restore them
+                    # e.g., HTTP_X_PLATFORM -> x-platform (not x_platform)
+                    header_name = key[5:].lower().replace("_", "-")
+                    headers[header_name] = value
 
             # 从 headers 或 auth 中提取元数据
             connection_uuid = headers.get("x-uuid") or str(uuid.uuid4())
