@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Callable, Dict, Optional
 
 from .client_base import WebSocketClientBase
-from .client_ws_connection import ConnectionConfig, NetworkEvent
+from .client_socketio_driver import ConnectionConfig, NetworkEvent
 from .message import APIMessageBase
 from .ws_config import MultiClientConfig, ConnectionEntry
 
