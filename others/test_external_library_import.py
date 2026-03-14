@@ -12,18 +12,28 @@ from typing import List, Dict, Any
 
 # 外部库导入测试 - 使用pip安装的maim_message包
 # API-Server Version 必须从子模块导入
-from maim_message.server import WebSocketServer, ServerConfig, AuthResult, create_server_config
+from maim_message.server import (
+    WebSocketServer,
+    ServerConfig,
+    AuthResult,
+    create_server_config,
+)
 from maim_message.client import WebSocketClient, ClientConfig, create_client_config
 from maim_message.message import (
-    APIMessageBase, BaseMessageInfo, Seg, MessageDim,
-    GroupInfo, UserInfo, SenderInfo, FormatInfo
+    APIMessageBase,
+    BaseMessageInfo,
+    Seg,
+    MessageDim,
+    GroupInfo,
+    UserInfo,
+    SenderInfo,
+    FormatInfo,
 )
 
 
 # 配置日志 - 设置INFO级别
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 logger = logging.getLogger(__name__)
@@ -45,7 +55,7 @@ class WebSocketTester:
             "custom_messages_sent": 0,
             "custom_messages_received": 0,
             "callback_triggered": 0,
-            "errors": []
+            "errors": [],
         }
 
         # 收集的数据
@@ -56,6 +66,7 @@ class WebSocketTester:
 
     def create_auth_handler(self):
         """创建认证处理器"""
+
         async def auth_handler(metadata):
             api_key = metadata.get("api_key", "")
             platform = metadata.get("platform", "unknown")
@@ -65,10 +76,12 @@ class WebSocketTester:
                 return True
             else:
                 return False
+
         return auth_handler
 
     def create_user_extractor(self):
         """创建用户标识提取器 - 将api_key转换为user_id"""
+
         async def user_extractor(metadata):
             api_key = metadata.get("api_key", "")
             if not api_key:
@@ -90,11 +103,15 @@ class WebSocketTester:
 
             logger.info(f"🔄 用户标识转换: api_key='{api_key}' -> user_id='{user_id}'")
             return user_id
+
         return user_extractor
 
     def create_message_handlers(self):
         """创建消息处理器"""
-        async def message_handler(server_message: APIMessageBase, metadata: Dict[str, Any]):
+
+        async def message_handler(
+            server_message: APIMessageBase, metadata: Dict[str, Any]
+        ):
             """处理标准消息"""
             try:
                 logger.info(f"📨 收到标准消息: {server_message.message_segment.data}")
@@ -105,13 +122,15 @@ class WebSocketTester:
                 self.test_results["callback_triggered"] += 1
 
                 # 保存收到的消息
-                self.received_messages.append({
-                    "data": server_message.message_segment.data,
-                    "api_key": server_message.get_api_key(),
-                    "platform": server_message.get_platform(),
-                    "message_id": server_message.message_info.message_id,
-                    "timestamp": time.time()
-                })
+                self.received_messages.append(
+                    {
+                        "data": server_message.message_segment.data,
+                        "api_key": server_message.get_api_key(),
+                        "platform": server_message.get_platform(),
+                        "message_id": server_message.message_info.message_id,
+                        "timestamp": time.time(),
+                    }
+                )
 
             except Exception as e:
                 logger.error(f"消息处理器错误: {e}")
@@ -127,11 +146,13 @@ class WebSocketTester:
                 self.test_results["callback_triggered"] += 1
 
                 # 保存自定义消息
-                self.received_custom_messages.append({
-                    "type": "custom_ping",
-                    "payload": payload,
-                    "timestamp": time.time()
-                })
+                self.received_custom_messages.append(
+                    {
+                        "type": "custom_ping",
+                        "payload": payload,
+                        "timestamp": time.time(),
+                    }
+                )
 
                 # 自动回复PONG - 服务端根据连接元数据确定用户
                 await self.send_pong_response(payload, metadata)
@@ -157,22 +178,21 @@ class WebSocketTester:
 
         return message_handler, ping_handler, status_handler
 
-    async def send_pong_response(self, original_ping: Dict[str, Any], metadata: Dict[str, Any]):
+    async def send_pong_response(
+        self, original_ping: Dict[str, Any], metadata: Dict[str, Any]
+    ):
         """发送PONG响应"""
         pong_message = APIMessageBase(
             message_info=BaseMessageInfo(
                 platform="server",
                 message_id=f"pong_{int(time.time() * 1000)}",
-                time=time.time()
+                time=time.time(),
             ),
             message_segment=Seg(
                 type="text",
-                data=f"PONG response to: {original_ping.get('message', 'unknown')}"
+                data=f"PONG response to: {original_ping.get('message', 'unknown')}",
             ),
-            message_dim=MessageDim(
-                api_key="server",
-                platform="server"
-            )
+            message_dim=MessageDim(api_key="server", platform="server"),
         )
 
         # 服务端根据连接元数据中的connection_uuid获取对应的user_id
@@ -183,7 +203,9 @@ class WebSocketTester:
             if user_id:
                 results = await self.server.send_message(user_id, pong_message)
                 success_count = sum(results.values())
-                logger.info(f"   📤 发送PONG给用户 {user_id}: {success_count} 个连接成功")
+                logger.info(
+                    f"   📤 发送PONG给用户 {user_id}: {success_count} 个连接成功"
+                )
             else:
                 logger.warning(f"   ⚠️ 找不到连接 {connection_uuid} 对应的用户")
         else:
@@ -196,29 +218,25 @@ class WebSocketTester:
             "connected_users": self.server.get_user_count(),
             "connected_clients": self.server.get_connection_count(),
             "messages_processed": self.test_results["messages_received"],
-            "custom_messages_processed": self.test_results["custom_messages_received"]
+            "custom_messages_processed": self.test_results["custom_messages_received"],
         }
 
         status_message = APIMessageBase(
             message_info=BaseMessageInfo(
                 platform="server",
                 message_id=f"status_{int(time.time() * 1000)}",
-                time=time.time()
+                time=time.time(),
             ),
-            message_segment=Seg(
-                type="json",
-                data=str(status_info)
-            ),
-            message_dim=MessageDim(
-                api_key="server",
-                platform="server"
-            )
+            message_segment=Seg(type="json", data=str(status_info)),
+            message_dim=MessageDim(api_key="server", platform="server"),
         )
 
         await self.server.broadcast_message(status_message)
         logger.info(f"   📊 广播状态信息: {status_info}")
 
-    def create_standard_message(self, platform: str, api_key: str, message_content: str) -> APIMessageBase:
+    def create_standard_message(
+        self, platform: str, api_key: str, message_content: str
+    ) -> APIMessageBase:
         """创建标准APIMessageBase消息"""
         return APIMessageBase(
             message_info=BaseMessageInfo(
@@ -230,27 +248,20 @@ class WebSocketTester:
                         platform=platform,
                         user_id="test_user_001",
                         user_nickname="测试用户",
-                        user_cardname="测试卡片"
+                        user_cardname="测试卡片",
                     ),
                     group_info=GroupInfo(
                         group_id="test_group_001",
                         group_name="测试群组",
-                        platform=platform
-                    )
+                        platform=platform,
+                    ),
                 ),
                 format_info=FormatInfo(
-                    content_format=["text"],
-                    accept_format=["text", "emoji"]
-                )
+                    content_format=["text"], accept_format=["text", "emoji"]
+                ),
             ),
-            message_segment=Seg(
-                type="text",
-                data=message_content
-            ),
-            message_dim=MessageDim(
-                api_key=api_key,
-                platform=platform
-            )
+            message_segment=Seg(type="text", data=message_content),
+            message_dim=MessageDim(api_key=api_key, platform=platform),
         )
 
     async def setup_server(self):
@@ -258,11 +269,7 @@ class WebSocketTester:
         logger.info("🚀 启动WebSocket服务器...")
 
         # 创建服务器配置
-        server_config = ServerConfig(
-            host=self.host,
-            port=self.port,
-            path="/ws"
-        )
+        server_config = ServerConfig(host=self.host, port=self.port, path="/ws")
 
         # 设置认证和用户标识提取处理器
         server_config.on_auth = self.create_auth_handler()
@@ -280,7 +287,7 @@ class WebSocketTester:
                 "type": "connect",
                 "connection_uuid": connection_uuid,
                 "metadata": metadata,
-                "timestamp": time.time()
+                "timestamp": time.time(),
             }
             self.connection_events.append(event)
             logger.info(f"🔗 客户端连接: {connection_uuid}")
@@ -290,13 +297,10 @@ class WebSocketTester:
                 "type": "disconnect",
                 "connection_uuid": connection_uuid,
                 "error": error,
-                "timestamp": time.time()
+                "timestamp": time.time(),
             }
             self.disconnect_events.append(event)
             logger.info(f"🔌 客户端断开: {connection_uuid}")
-
-        server_config.on_connect = connect_handler
-        server_config.on_disconnect = disconnect_handler
 
         # 创建服务器
         self.server = WebSocketServer(server_config)
@@ -314,19 +318,23 @@ class WebSocketTester:
 
         for i in range(client_count):
             platform = platforms[i % len(platforms)]
-            api_key = f"test_user_{i+1:03d}"
+            api_key = f"test_user_{i + 1:03d}"
 
             # 创建客户端配置
             client_config = ClientConfig(
                 url=f"ws://{self.host}:{self.port}/ws",
                 api_key=api_key,
                 platform=platform,
-                auto_reconnect=True
+                auto_reconnect=True,
             )
 
             # 设置客户端消息处理器
-            async def client_message_handler(server_message, metadata, client_idx=i+1):
-                logger.info(f"📤 客户端{client_idx}收到: {server_message.message_segment.data}")
+            async def client_message_handler(
+                server_message, metadata, client_idx=i + 1
+            ):
+                logger.info(
+                    f"📤 客户端{client_idx}收到: {server_message.message_segment.data}"
+                )
                 self.test_results["callback_triggered"] += 1
 
             client_config.on_message = client_message_handler
@@ -343,9 +351,9 @@ class WebSocketTester:
 
             if client.is_connected():
                 self.test_results["clients_connected"] += 1
-                logger.info(f"✅ 客户端{i+1} ({platform}) 连接成功")
+                logger.info(f"✅ 客户端{i + 1} ({platform}) 连接成功")
             else:
-                logger.warning(f"⚠️ 客户端{i+1} ({platform}) 连接失败")
+                logger.warning(f"⚠️ 客户端{i + 1} ({platform}) 连接失败")
 
     async def test_standard_messages(self):
         """测试标准消息发送"""
@@ -354,7 +362,7 @@ class WebSocketTester:
         test_messages = [
             ("wechat", "test_user_001", "Hello from WeChat client!"),
             ("qq", "test_user_002", "Hello from QQ client!"),
-            ("telegram", "test_user_003", "Hello from Telegram client!")
+            ("telegram", "test_user_003", "Hello from Telegram client!"),
         ]
 
         for platform, api_key, content in test_messages:
@@ -367,7 +375,9 @@ class WebSocketTester:
                     success = await client.send_message(message)
                     if success:
                         self.test_results["messages_sent"] += 1
-                        logger.info(f"✅ {platform} 客户端发送成功 (api_key: {api_key})")
+                        logger.info(
+                            f"✅ {platform} 客户端发送成功 (api_key: {api_key})"
+                        )
                     else:
                         logger.error(f"❌ {platform} 客户端发送失败")
                     break
@@ -386,24 +396,22 @@ class WebSocketTester:
                 message_info=BaseMessageInfo(
                     platform="server",
                     message_id=f"server_{int(time.time() * 1000)}",
-                    time=time.time()
+                    time=time.time(),
                 ),
                 message_segment=Seg(
-                    type="text",
-                    data=f"服务器消息给 {user_id} (已转换的用户标识)"
+                    type="text", data=f"服务器消息给 {user_id} (已转换的用户标识)"
                 ),
-                message_dim=MessageDim(
-                    api_key="server",
-                    platform="server"
-                )
+                message_dim=MessageDim(api_key="server", platform="server"),
             )
 
             # 使用转换后的user_id发送 - 测试路由
-            results = await self.server.send_message(user_id, response_message)
+            results = await self.server.send_message(response_message)
             success_count = sum(results.values())
             if success_count > 0:
                 self.test_results["messages_sent"] += 1
-                logger.info(f"✅ 服务端向用户 {user_id} 发送成功: {success_count} 个连接")
+                logger.info(
+                    f"✅ 服务端向用户 {user_id} 发送成功: {success_count} 个连接"
+                )
             else:
                 logger.warning(f"⚠️ 用户 {user_id} 没有在线连接")
 
@@ -416,25 +424,28 @@ class WebSocketTester:
         # 每个客户端发送PING和状态查询
         for i, client in enumerate(self.clients):
             # 发送PING - 客户端只知道自己知道的api_key，不包含user_id
-            ping_success = await client.send_custom_message("ping", {
-                "message": f"Hello from client {i+1}",
-                "timestamp": time.time()
-            })
+            ping_success = await client.send_custom_message(
+                "ping",
+                {"message": f"Hello from client {i + 1}", "timestamp": time.time()},
+            )
 
             if ping_success:
                 self.test_results["custom_messages_sent"] += 1
-                logger.info(f"✅ 客户端{i+1} PING发送成功")
+                logger.info(f"✅ 客户端{i + 1} PING发送成功")
 
             # 发送状态查询
-            status_success = await client.send_custom_message("status", {
-                "request_type": "server_status",
-                "client_id": i+1,
-                "timestamp": time.time()
-            })
+            status_success = await client.send_custom_message(
+                "status",
+                {
+                    "request_type": "server_status",
+                    "client_id": i + 1,
+                    "timestamp": time.time(),
+                },
+            )
 
             if status_success:
                 self.test_results["custom_messages_sent"] += 1
-                logger.info(f"✅ 客户端{i+1} 状态查询发送成功")
+                logger.info(f"✅ 客户端{i + 1} 状态查询发送成功")
 
             await asyncio.sleep(0.3)  # 消息间隔
 
@@ -446,16 +457,12 @@ class WebSocketTester:
             message_info=BaseMessageInfo(
                 platform="server",
                 message_id=f"broadcast_{int(time.time() * 1000)}",
-                time=time.time()
+                time=time.time(),
             ),
             message_segment=Seg(
-                type="text",
-                data="📢 Broadcast message from server to all clients!"
+                type="text", data="📢 Broadcast message from server to all clients!"
             ),
-            message_dim=MessageDim(
-                api_key="server",
-                platform="server"
-            )
+            message_dim=MessageDim(api_key="server", platform="server"),
         )
 
         results = await self.server.broadcast_message(broadcast_message)
@@ -470,13 +477,13 @@ class WebSocketTester:
             # 优雅停止所有客户端
             for i, client in enumerate(self.clients):
                 try:
-                    logger.info(f"🔄 正在停止客户端{i+1}...")
+                    logger.info(f"🔄 正在停止客户端{i + 1}...")
                     await asyncio.wait_for(client.stop(), timeout=5.0)
-                    logger.info(f"✅ 客户端{i+1} 已优雅停止")
+                    logger.info(f"✅ 客户端{i + 1} 已优雅停止")
                 except asyncio.TimeoutError:
-                    logger.warning(f"⚠️ 客户端{i+1} 停止超时，但已触发关闭信号")
+                    logger.warning(f"⚠️ 客户端{i + 1} 停止超时，但已触发关闭信号")
                 except Exception as e:
-                    logger.error(f"❌ 客户端{i+1} 停止时出错: {e}")
+                    logger.error(f"❌ 客户端{i + 1} 停止时出错: {e}")
 
             # 优雅停止服务器
             if self.server:
@@ -494,17 +501,20 @@ class WebSocketTester:
         except Exception as e:
             logger.error(f"❌ 清理过程中发生错误: {e}")
             import traceback
+
             logger.error(f"Traceback: {traceback.format_exc()}")
 
     def print_test_results(self):
         """打印测试结果"""
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("🧪 WebSocket API 测试结果")
-        print("="*60)
+        print("=" * 60)
 
         print(f"\n📊 基本统计:")
         print(f"  服务器启动: {'✅' if self.test_results['server_started'] else '❌'}")
-        print(f"  客户端连接数: {self.test_results['clients_connected']}/{len(self.clients)}")
+        print(
+            f"  客户端连接数: {self.test_results['clients_connected']}/{len(self.clients)}"
+        )
         print(f"  标准消息发送: {self.test_results['messages_sent']}")
         print(f"  标准消息接收: {self.test_results['messages_received']}")
         print(f"  自定义消息发送: {self.test_results['custom_messages_sent']}")
@@ -531,17 +541,17 @@ class WebSocketTester:
                 print(f"  - {msg['type']}: {msg['payload']}")
 
         success = (
-            self.test_results['server_started'] and
-            self.test_results['clients_connected'] == len(self.clients) and
-            self.test_results['messages_sent'] > 0 and
-            self.test_results['messages_received'] > 0 and
-            self.test_results['custom_messages_sent'] > 0 and
-            self.test_results['custom_messages_received'] > 0 and
-            len(self.test_results['errors']) == 0
+            self.test_results["server_started"]
+            and self.test_results["clients_connected"] == len(self.clients)
+            and self.test_results["messages_sent"] > 0
+            and self.test_results["messages_received"] > 0
+            and self.test_results["custom_messages_sent"] > 0
+            and self.test_results["custom_messages_received"] > 0
+            and len(self.test_results["errors"]) == 0
         )
 
         print(f"\n🎯 测试结果: {'✅ 全部通过' if success else '❌ 存在问题'}")
-        print("="*60)
+        print("=" * 60)
 
         return success
 
@@ -557,8 +567,7 @@ async def main():
 
         # 等待测试完成或超时
         done, pending = await asyncio.wait(
-            [test_task, timeout_task],
-            return_when=asyncio.FIRST_COMPLETED
+            [test_task, timeout_task], return_when=asyncio.FIRST_COMPLETED
         )
 
         # 取消未完成的任务
@@ -579,6 +588,7 @@ async def main():
     except Exception as e:
         print(f"❌ 测试过程中发生错误: {e}")
         import traceback
+
         traceback.print_exc()
     finally:
         # 清理资源 - 确保在任何情况下都执行优雅关闭

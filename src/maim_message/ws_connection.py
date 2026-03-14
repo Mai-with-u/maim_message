@@ -7,11 +7,10 @@ import os
 import ssl
 from typing import Any, Dict, Optional, Set
 
+import socketio
 import aiohttp
-from aiohttp import WSMsgType
+from aiohttp import web
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from starlette.websockets import WebSocketState
 
 from .connection_interface import (
     BaseConnection,
@@ -48,14 +47,14 @@ def _looks_like_connection_error(exc: BaseException) -> bool:
 
 
 class WebSocketServer(BaseConnection, ServerConnectionInterface):
-    """基于 WebSocket 的服务器实现。"""
+    """基于 Socket.IO 的服务器实现。"""
 
     def __init__(
         self,
         host: str = "0.0.0.0",
         port: int = 18000,
         path: str = "/ws",
-        app: Optional[FastAPI] = None,
+        app: Optional[web.Application] = None,
         *,
         ssl_certfile: Optional[str] = None,
         ssl_keyfile: Optional[str] = None,
@@ -69,7 +68,7 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
         self.host = host
         self.port = port
         self.path = path
-        self.app = app or FastAPI()
+        self.app = app or web.Application()
         self.own_app = app is None
         self.ssl_certfile = ssl_certfile
         self.ssl_keyfile = ssl_keyfile
@@ -81,117 +80,76 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
         self.enable_token = enable_token
         self.valid_tokens: Set[str] = set()
 
-        self.active_websockets: Set[WebSocket] = set()
-        self.platform_websockets: Dict[str, WebSocket] = {}
+        # Socket.IO server
+        self.sio = socketio.AsyncServer(
+            async_mode="aiohttp",
+            ping_interval=25,
+            ping_timeout=5,
+            cors_allowed_origins="*",
+            max_http_buffer_size=max_message_size,
+        )
+
+        # Connection management: platform <-> sid mapping
+        self.platform_sids: Dict[str, str] = {}  # platform -> sid
+        self.sid_platforms: Dict[str, str] = {}  # sid -> platform
 
         self.server: Optional[uvicorn.Server] = None
 
-        self._setup_routes()
+        self._setup_socketio_handlers()
+
+        # If using external app, mount Socket.IO
+        if not self.own_app:
+            self.sio.attach(self.app, socketio_path=self.path.lstrip("/"))
 
     # ------------------------------------------------------------------
-    # 路由与连接管理
+    # Socket.IO 事件处理
     # ------------------------------------------------------------------
-    def _setup_routes(self) -> None:
-        @self.app.websocket(self.path)
-        async def websocket_endpoint(websocket: WebSocket) -> None:
-            await websocket.accept()
+    def _setup_socketio_handlers(self) -> None:
+        @self.sio.event
+        async def connect(sid: str, environ: dict) -> None:
+            # Extract platform from HTTP headers
+            platform = environ.get("HTTP_PLATFORM", "unknown")
 
-            platform = websocket.headers.get("platform", "unknown")
-
+            # Token validation
             if self.enable_token:
-                auth_header = websocket.headers.get("authorization")
+                auth_header = environ.get("HTTP_AUTHORIZATION")
                 if not auth_header or not await self.verify_token(auth_header):
                     logger.warning(f"拒绝平台 {platform} 的连接请求: 令牌无效")
-                    await websocket.close(code=1008, reason="无效的令牌")
-                    return
+                    raise socketio.exceptions.ConnectionRefusedError("无效的令牌")  # type: ignore[attr-defined]
 
-            self.active_websockets.add(websocket)
+            # Register connection
+            self.sid_platforms[sid] = platform
+            self.platform_sids[platform] = sid
 
+            # Handle duplicate connections from same platform
             if platform != "unknown":
-                previous = self.platform_websockets.get(platform)
-                if previous and previous is not websocket:
-                    logger.warning(f"检测到平台 {platform} 已有连接，正在关闭旧连接以接受新连接")
-                    try:
-                        await previous.close(code=1000, reason="新的连接已建立")
-                    except Exception:
-                        logger.debug(
-                            f"关闭平台 {platform} 旧连接时出现异常", exc_info=True
-                        )
-                    finally:
-                        self._remove_websocket(previous, platform, force=True)
-
-                self.platform_websockets[platform] = websocket
-                logger.info(f"平台 {platform} WebSocket 已连接")
+                logger.info(f"平台 {platform} Socket.IO 已连接 (sid={sid})")
             else:
-                logger.info("收到未标记平台的 WebSocket 连接")
+                logger.info(f"新的 Socket.IO 连接已建立 (sid={sid})")
 
-            try:
-                while True:
-                    try:
-                        message = await websocket.receive_json()
-                    except ValueError as exc:
-                        logger.warning(f"平台 {platform} 收到无法解析的 JSON: {exc}")
-                        continue
+        @self.sio.event
+        async def disconnect(sid: str) -> None:
+            platform = self.sid_platforms.pop(sid, None)
+            if platform:
+                if self.platform_sids.get(platform) == sid:
+                    del self.platform_sids[platform]
+                logger.info(f"平台 {platform} Socket.IO 已断开 (sid={sid})")
+            else:
+                logger.info(f"Socket.IO 连接已断开 (sid={sid})")
 
-                    if platform != "unknown":
-                        current = self.platform_websockets.get(platform)
-                        if current is not websocket:
-                            self.platform_websockets[platform] = websocket
+        @self.sio.on("message")  # type: ignore[union-attr]
+        async def handle_message(sid: str, data: Any) -> None:
+            platform = self.sid_platforms.get(sid, "unknown")
 
-                    task = asyncio.create_task(self.process_message(message))
-                    self.add_background_task(task)
-            except WebSocketDisconnect:
-                logger.info(f"平台 {platform} WebSocket 已断开")
-                self._remove_websocket(websocket, platform, force=True)
-            except ConnectionResetError:
-                logger.warning(f"平台 {platform} WebSocket 连接被重置")
-                self._remove_websocket(websocket, platform, force=True)
-            except asyncio.CancelledError:
-                logger.debug(f"平台 {platform} WebSocket 任务被取消")
-                self._remove_websocket(websocket, platform, force=True)
-            except Exception as exc:  # pylint: disable=broad-except
-                if _looks_like_connection_error(exc):
-                    logger.debug(f"平台 {platform} WebSocket 连接关闭: {exc}")
-                else:
-                    logger.exception(f"平台 {platform} WebSocket 处理异常")
-                self._remove_websocket(websocket, platform, force=True)
+            # Add metadata to message
+            if isinstance(data, dict):
+                data["_platform"] = platform
+                data["_sid"] = sid
+            elif data is None:
+                data = {"_platform": platform, "_sid": sid}
 
-    def _remove_websocket(
-        self,
-        websocket: WebSocket,
-        platform: Optional[str],
-        *,
-        force: bool = False,
-    ) -> None:
-        state = getattr(websocket, "client_state", None)
-        state_name = None
-        if isinstance(state, WebSocketState):
-            state_name = state.name
-        elif state is not None:
-            state_name = str(state)
-
-        if not force and state == WebSocketState.CONNECTED:
-            logger.debug(
-                f"跳过移除 WebSocket (platform={platform}, ws_id={id(websocket)}) 因状态仍为 CONNECTED"
-            )
-            return
-
-        logger.debug(
-            f"移除 WebSocket (platform={platform}, ws_id={id(websocket)}, state={state_name}, force={force})"
-        )
-
-        self.active_websockets.discard(websocket)
-
-        if platform and self.platform_websockets.get(platform) is websocket:
-            del self.platform_websockets[platform]
-            logger.debug(f"已移除平台 {platform} 的 WebSocket 映射")
-            return
-
-        for key, value in list(self.platform_websockets.items()):
-            if value is websocket:
-                del self.platform_websockets[key]
-                logger.debug(f"移除了非直接映射的平台 {key} 的 WebSocket")
-                break
+            task = asyncio.create_task(self.process_message(data))
+            self.add_background_task(task)
 
     # ------------------------------------------------------------------
     # 安全与配置信息
@@ -219,16 +177,25 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
                 f"启用 SSL 证书: certfile={self.ssl_certfile}, keyfile={self.ssl_keyfile}"
             )
 
+    def _build_ssl_context(self) -> Optional[ssl.SSLContext]:
+        """Build SSL context for aiohttp."""
+        if not self.ssl_certfile or not self.ssl_keyfile:
+            return None
+
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(self.ssl_certfile, self.ssl_keyfile)
+        return ssl_context
+
     def _build_uvicorn_config(self) -> uvicorn.Config:
+        ssl_context = self._build_ssl_context()
+
         config_kwargs = {
             "host": self.host,
             "port": self.port,
-            "ssl_certfile": self.ssl_certfile,
-            "ssl_keyfile": self.ssl_keyfile,
-            "ws_max_size": self.max_message_size,
-            "ws_ping_interval": self.heartbeat_interval,
-            "ws_ping_timeout": self.heartbeat_timeout,
         }
+
+        if ssl_context is not None:
+            config_kwargs["ssl"] = ssl_context
 
         if self.enable_custom_uvicorn_logger:
             config_kwargs["log_config"] = get_uvicorn_log_config()
@@ -246,21 +213,39 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
         self._running = True
 
         if not self.own_app:
-            logger.info("WebSocket 服务已挂载至外部 FastAPI 应用，仅注册路由")
+            logger.info("Socket.IO 服务已挂载至外部 aiohttp 应用，仅注册路由")
             return
 
         self._validate_ssl_files()
 
-        config = self._build_uvicorn_config()
-        self.server = uvicorn.Server(config)
+        # For own app, we need to attach the socketio server
+        self.sio.attach(self.app, socketio_path=self.path.lstrip("/"))
+
+        ssl_context = self._build_ssl_context()
+        from aiohttp import web
+
+        self._runner = web.AppRunner(self.app)
+        await self._runner.setup()
+
+        if ssl_context:
+            site = web.TCPSite(
+                self._runner, self.host, self.port, ssl_context=ssl_context
+            )
+        else:
+            site = web.TCPSite(self._runner, self.host, self.port)
+        await site.start()
+
+        logger.info(f"Socket.IO 服务器已启动: http://{self.host}:{self.port}")
 
         try:
-            await self.server.serve()
+            await asyncio.Event().wait()
         except Exception:  # pylint: disable=broad-except
-            logger.exception("WebSocket 服务器启动失败")
+            logger.exception("Socket.IO 服务器启动失败")
             raise
         finally:
-            self.server = None
+            if self._runner:
+                await self._runner.cleanup()
+            self._runner = None
             self._running = False
 
     def run_sync(self) -> None:
@@ -270,10 +255,13 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
         self._running = True
 
         if not self.own_app:
-            logger.info("WebSocket 服务已挂载至外部 FastAPI 应用，仅注册路由")
+            logger.info("Socket.IO 服务已挂载至外部 aiohttp 应用，仅注册路由")
             return
 
         self._validate_ssl_files()
+
+        # For own app, we need to attach the socketio server
+        self.sio.attach(self.app, socketio_path=self.path.lstrip("/"))
 
         config = self._build_uvicorn_config()
         server = uvicorn.Server(config)
@@ -281,7 +269,7 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
         try:
             server.run()
         except Exception:  # pylint: disable=broad-except
-            logger.exception("WebSocket 服务器运行失败")
+            logger.exception("Socket.IO 服务器运行失败")
             raise
         finally:
             self._running = False
@@ -292,16 +280,26 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
 
         self._running = False
 
-        for websocket in list(self.active_websockets):
+        # Disconnect all clients
+        for sid in list(self.sid_platforms.keys()):
             try:
-                await websocket.close(code=1000, reason="服务器关闭")
+                await self.sio.disconnect(sid)
             except Exception:
-                logger.debug("关闭 WebSocket 连接时出现异常", exc_info=True)
+                logger.debug(f"断开客户端 {sid} 时出现异常")
 
-        self.active_websockets.clear()
-        self.platform_websockets.clear()
+        # Clear connection mappings
+        self.sid_platforms.clear()
+        self.platform_sids.clear()
 
         await self.cleanup_tasks()
+
+        if self._runner is not None:
+            try:
+                await self._runner.cleanup()
+            except Exception:
+                logger.warning("停止 Socket.IO 服务器时出现异常", exc_info=True)
+            finally:
+                self._runner = None
 
         if self.server is not None:
             try:
@@ -312,7 +310,7 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
                 if hasattr(self.server, "shutdown"):
                     await self.server.shutdown()
             except Exception:
-                logger.warning("停止 WebSocket 服务器时出现异常", exc_info=True)
+                logger.warning("停止 Socket.IO 服务器时出现异常", exc_info=True)
             finally:
                 self.server = None
 
@@ -320,73 +318,45 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
     # 消息发送与广播
     # ------------------------------------------------------------------
     async def broadcast_message(self, message: Dict[str, Any]) -> None:
-        disconnected: Set[WebSocket] = set()
-
-        for websocket in list(self.active_websockets):
-            if websocket.client_state != WebSocketState.CONNECTED:
-                disconnected.add(websocket)
-                continue
-
-            try:
-                await websocket.send_json(message)
-            except (WebSocketDisconnect, ConnectionResetError):
-                disconnected.add(websocket)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.warning(f"广播消息失败: {exc}")
-                if _looks_like_connection_error(exc):
-                    disconnected.add(websocket)
-
-        for websocket in disconnected:
-            platform = None
-            for key, value in self.platform_websockets.items():
-                if value is websocket:
-                    platform = key
-                    break
-
-            self.active_websockets.discard(websocket)
-            if platform:
-                del self.platform_websockets[platform]
+        try:
+            await self.sio.emit("message", message)
+            logger.debug(f"广播消息成功，接收者: 所有已连接客户端")
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"广播消息失败: {exc}")
 
     async def send_message(self, target: str, message: Dict[str, Any]) -> bool:
         logger.debug(
-            f"准备向平台 {target} 发送消息，当前映射平台: {list(self.platform_websockets.keys())}"
+            f"准备向平台 {target} 发送消息，当前映射平台: {list(self.platform_sids.keys())}"
         )
-        websocket = self.platform_websockets.get(target)
-        if not websocket:
+
+        sid = self.platform_sids.get(target)
+        if not sid:
             logger.warning(f"未找到目标平台: {target}")
             return False
 
-        if websocket.client_state != WebSocketState.CONNECTED:
-            logger.warning(f"平台 {target} 的 WebSocket 连接已关闭")
-            self._remove_websocket(websocket, target, force=True)
-            return False
-
-        logger.debug(
-            f"平台 {target} WebSocket 状态: "
-            f"{websocket.client_state.name if isinstance(websocket.client_state, WebSocketState) else str(websocket.client_state)} "
-            f"(ws_id={id(websocket)})"
-        )
-
         try:
-            await websocket.send_json(message)
-            logger.debug(f"向平台 {target} 发送消息成功")
+            await self.sio.emit("message", message, room=sid)
+            logger.debug(f"向平台 {target} 发送消息成功 (sid={sid})")
             return True
-        except WebSocketDisconnect:
-            logger.warning(f"平台 {target} WebSocket 连接断开")
-        except ConnectionResetError:
-            logger.warning(f"平台 {target} 连接被重置")
         except Exception as exc:  # pylint: disable=broad-except
             if _looks_like_connection_error(exc):
                 logger.debug(f"平台 {target} 连接异常: {exc}")
             else:
                 logger.exception(f"发送消息到平台 {target} 失败")
-        self._remove_websocket(websocket, target, force=True)
 
-        return False
+            # Clean up stale mapping
+            if target in self.platform_sids:
+                del self.platform_sids[target]
+            for s, p in list(self.sid_platforms.items()):
+                if p == target:
+                    del self.sid_platforms[s]
+                    break
+
+            return False
 
 
 class WebSocketClient(BaseConnection, ClientConnectionInterface):
-    """基于 WebSocket 的客户端实现。"""
+    """基于 Socket.IO 的客户端实现。"""
 
     def __init__(self) -> None:
         super().__init__()
@@ -397,16 +367,40 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
         self.headers: Dict[str, str] = {}
         self.max_message_size: int = 104_857_600
 
-        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self.ws_connected: bool = False
-        self.session: Optional[aiohttp.ClientSession] = None
+        # aiohttp session for SSL connections
+        self.http_session: Optional[aiohttp.ClientSession] = None
 
-        self.reconnect_interval: int = 2
-        self.retry_count: int = 0
+        # Socket.IO client
+        self.sio = socketio.AsyncClient(
+            reconnection=True,
+            reconnection_attempts=0,  # infinite
+            reconnection_delay=1,
+            reconnection_delay_max=5,
+            http_session=None,  # Will be set in configure() when SSL is needed
+        )
 
-        self.heartbeat_interval: int = 20
+        self._connected = False
 
-        self._monitor_task: Optional[asyncio.Task] = None
+        self._setup_handlers()
+
+    # ------------------------------------------------------------------
+    # Socket.IO 事件处理
+    # ------------------------------------------------------------------
+    def _setup_handlers(self) -> None:
+        @self.sio.event
+        async def connect() -> None:
+            self._connected = True
+            logger.info(f"已连接到服务器")
+
+        @self.sio.event
+        async def disconnect() -> None:
+            self._connected = False
+            logger.info(f"与服务器断开连接")
+
+        @self.sio.on("message")  # type: ignore[union-attr]
+        async def on_message(data: Any) -> None:
+            task = asyncio.create_task(self.process_message(data))
+            self.add_background_task(task)
 
     # ------------------------------------------------------------------
     # 配置与连接管理
@@ -421,19 +415,54 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
         max_message_size: Optional[int] = None,
         heartbeat_interval: Optional[int] = None,
     ) -> None:
-        self.url = url
+        # Transform URL: ws:// -> http://, wss:// -> https://
+        self.url = url.replace("ws://", "http://").replace("wss://", "https://")
+
+        # Remove path suffix for socketio.connect() - it will append the path
+        # Socket.IO uses query params for the path, not URL path
+        # Keep the path but transform protocol
+
         self.platform = platform
         self.token = token
         self.ssl_verify = ssl_verify
 
         if max_message_size is not None:
             self.max_message_size = max_message_size
-        if heartbeat_interval is not None:
-            self.heartbeat_interval = max(1, int(heartbeat_interval))
+        # Note: heartbeat is handled by Socket.IO internally (ping_interval/ping_timeout)
 
         self.headers = {"platform": platform}
         if token:
             self.headers["Authorization"] = str(token)
+
+        # Create http_session for SSL connections
+        if self.ssl_verify and self.url.startswith("https://"):
+            logger.info(f"使用证书验证: {self.ssl_verify}")
+            ssl_context = ssl.create_default_context()
+            ssl_context.load_verify_locations(self.ssl_verify)
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            self.http_session = aiohttp.ClientSession(connector=connector)
+            # Reinitialize sio with http_session
+            self.sio = socketio.AsyncClient(
+                reconnection=True,
+                reconnection_attempts=0,
+                reconnection_delay=1,
+                reconnection_delay_max=5,
+                http_session=self.http_session,
+            )
+        elif self.url.startswith("https://"):
+            logger.warning("未提供证书验证，当前连接将跳过 SSL 校验")
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            self.http_session = aiohttp.ClientSession(connector=connector)
+            self.sio = socketio.AsyncClient(
+                reconnection=True,
+                reconnection_attempts=0,
+                reconnection_delay=1,
+                reconnection_delay_max=5,
+                http_session=self.http_session,
+            )
 
     async def connect(self) -> bool:
         global logger  # noqa: PLW0603 - 保持 log_utils 中的单例
@@ -442,83 +471,41 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
         if not self.url or not self.platform:
             raise ValueError("连接前必须先调用 configure 方法配置连接参数")
 
-        ssl_context = None
-        if self.url.startswith("wss://"):
-            ssl_context = ssl.create_default_context()
-            if self.ssl_verify:
-                logger.info(f"使用证书验证: {self.ssl_verify}")
-                ssl_context.load_verify_locations(self.ssl_verify)
-            else:
-                logger.warning("未提供证书验证，当前连接将跳过 SSL 校验")
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
+        options: Dict[str, Any] = {
+            "headers": self.headers,
+        }
+
+        # http_session is now set in configure() method when SSL is needed
+        # The sio client already has http_session configured
 
         try:
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
-            connector = aiohttp.TCPConnector(
-                ssl=ssl_context, enable_cleanup_closed=True
-            )
+            # Extract path from URL for Socket.IO
+            from urllib.parse import urlparse
 
-            if self.session and not self.session.closed:
-                await self.session.close()
+            parsed = urlparse(self.url)
+            path = parsed.path if parsed.path else "/ws"
 
-            self.session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                headers=self.headers,
-            )
+            logger.info(f"正在连接到 {self.url} (path={path})")
+            await self.sio.connect(self.url, socketio_path=path.lstrip("/"), **options)
 
-            ws_kwargs = {
-                "heartbeat": self.heartbeat_interval,
-                "autoping": True,
-                "compress": 15,
-                "autoclose": True,
-                "max_msg_size": self.max_message_size,
-            }
-
-            logger.info(f"正在连接到 {self.url}")
-            self.ws = await self.session.ws_connect(self.url, **ws_kwargs)
-
-            self.ws_connected = True
-            self.retry_count = 0
+            self._connected = True
             logger.info(f"已成功连接到 {self.url}")
             return True
 
-        except aiohttp.ClientConnectorError as exc:
-            logger.error(f"无法建立连接: {exc}")
-        except aiohttp.ClientSSLError as exc:
-            logger.error(f"SSL 错误: {exc}")
-        except aiohttp.ClientError as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             logger.error(f"连接错误: {exc}")
-        except Exception:  # pylint: disable=broad-except
-            logger.exception("连接时发生未预期的错误")
-        finally:
-            if not self.ws_connected:
-                await self._cleanup_session()
 
+        self._connected = False
         return False
-
-    async def _cleanup_session(self) -> None:
-        if self.session and not self.session.closed:
-            try:
-                await self.session.close()
-                await asyncio.sleep(0.05)
-            except Exception:
-                logger.debug("关闭 ClientSession 时出现异常", exc_info=True)
-            finally:
-                self.session = None
 
     async def _cleanup_connection(self) -> None:
         try:
-            if self.ws and not self.ws.closed:
-                await self.ws.close()
+            if self.sio.connected:
+                await self.sio.disconnect()
         except Exception:
-            logger.debug("关闭 WebSocket 时出现异常", exc_info=True)
+            logger.debug("关闭 Socket.IO 连接时出现异常", exc_info=True)
         finally:
-            self.ws = None
-
-        await self._cleanup_session()
-        self.ws_connected = False
+            self._connected = False
 
     # ------------------------------------------------------------------
     # 生命周期控制
@@ -527,185 +514,82 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
         global logger  # noqa: PLW0603 - 保持 log_utils 中的单例
         logger = get_logger()
 
-        if not self.ws_connected:
-            await self.connect()
-
         self._running = True
 
-        if not self._monitor_task or self._monitor_task.done():
-            self._monitor_task = asyncio.create_task(self._connection_monitor())
-            self.add_background_task(self._monitor_task)
+        if not self._connected:
+            success = await self.connect()
+            if not success:
+                logger.warning("初始连接失败，将在后台重试")
 
-        while self._running:
-            try:
-                if not self.ws_connected or not self.ws:
-                    success = await self.connect()
-                    if not success:
-                        retry_delay = min(
-                            10, self.reconnect_interval * (2 ** min(self.retry_count, 5))
-                        )
-                        logger.info(f"等待 {retry_delay} 秒后重试...")
-                        await asyncio.sleep(retry_delay)
-                        self.retry_count += 1
-                        continue
+        # Note: Socket.IO client handles reconnection automatically
+        # The client event loop is managed by the sio object
 
-                async for msg in self.ws:
-                    if not self._running:
-                        break
+        # Wait for disconnection or errors
+        try:
+            # The wait() method blocks until disconnection
+            await self.sio.wait()
+        except asyncio.CancelledError:
+            logger.debug("Socket.IO 客户端任务被取消")
+        except Exception as exc:  # pylint: disable=broad-except
+            if _looks_like_connection_error(exc):
+                logger.debug(f"Socket.IO 连接关闭: {exc}")
+            else:
+                logger.exception("Socket.IO 连接发生错误")
 
-                    if msg.type == WSMsgType.TEXT:
-                        try:
-                            data = msg.json()
-                        except ValueError as exc:
-                            logger.warning(f"无法解析服务器消息: {exc}")
-                            continue
-
-                        task = asyncio.create_task(self.process_message(data))
-                        self.add_background_task(task)
-                    elif msg.type == WSMsgType.BINARY:
-                        logger.debug("收到二进制消息，已忽略")
-                    elif msg.type == WSMsgType.PING:
-                        logger.debug("收到服务器 PING，自动回复 PONG")
-                    elif msg.type == WSMsgType.PONG:
-                        logger.debug("收到服务器 PONG 响应")
-                    elif msg.type == WSMsgType.ERROR:
-                        logger.error(f"WebSocket 连接错误: {self.ws.exception()}")
-                        self.ws_connected = False
-                        break
-                    elif msg.type == WSMsgType.CLOSED:
-                        logger.warning("WebSocket 连接已关闭")
-                        self.ws_connected = False
-                        break
-
-                self.ws_connected = False
-
-            except asyncio.CancelledError:
-                logger.debug("WebSocket 客户端任务被取消")
-                break
-            except KeyboardInterrupt:
-                logger.debug("WebSocket 客户端因用户中断而关闭")
-                self.ws_connected = False
-                break
-            except aiohttp.ServerTimeoutError:
-                logger.warning("WebSocket 心跳超时，尝试重连")
-                self.ws_connected = False
-                self.retry_count += 1
-            except Exception as exc:  # pylint: disable=broad-except
-                if _looks_like_connection_error(exc):
-                    logger.debug(f"WebSocket 连接关闭: {exc}")
-                else:
-                    logger.exception("WebSocket 连接发生错误")
-                self.ws_connected = False
-                self.retry_count += 1
-                await self._cleanup_connection()
-            finally:
-                if self.ws and (self.ws.closed or self.ws.exception()):
-                    self.ws_connected = False
-
-            if self._running and not self.ws_connected:
-                retry_delay = min(
-                    10, self.reconnect_interval * (2 ** min(self.retry_count, 5))
-                )
-                logger.info(f"等待 {retry_delay} 秒后重试...")
-                await asyncio.sleep(retry_delay)
-
-    async def stop(self) -> None:
-        logger.info("正在停止 WebSocket 客户端...")
         self._running = False
 
-        if self.ws and not self.ws.closed:
-            try:
-                await self.ws.close()
-                logger.debug("WebSocket 连接已关闭")
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.warning(f"关闭 WebSocket 时出现异常: {exc}")
-            finally:
-                self.ws = None
+    async def stop(self) -> None:
+        logger.info("正在停止 Socket.IO 客户端...")
+        self._running = False
 
-        if self._monitor_task and not self._monitor_task.done():
-            self._monitor_task.cancel()
-            try:
-                await self._monitor_task
-            except asyncio.CancelledError:
-                pass
+        try:
+            if self.sio.connected:
+                await self.sio.disconnect()
+                logger.debug("Socket.IO 连接已关闭")
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"关闭 Socket.IO 时出现异常: {exc}")
+
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+            logger.debug("aiohttp session 已关闭")
 
         await self.cleanup_tasks()
 
-        await self._cleanup_session()
-
-        self.ws_connected = False
-        self._monitor_task = None
-        logger.info("WebSocket 客户端已停止")
+        self._connected = False
+        logger.info("Socket.IO 客户端已停止")
 
     async def send_message(self, target: str, message: Dict[str, Any]) -> bool:
         if not self.is_connected():
-            logger.warning("WebSocket 未连接，无法发送消息")
+            logger.warning("Socket.IO 未连接，无法发送消息")
             return False
 
         try:
-            await self.ws.send_json(message)  # type: ignore[union-attr]
+            # Emit to server - target is ignored for client (server knows who we are)
+            await self.sio.emit("message", message)
             return True
-        except ConnectionResetError:
-            logger.warning("连接被重置，标记为断开")
         except Exception as exc:  # pylint: disable=broad-except
             logger.error(f"发送消息失败: {exc}")
 
-        self.ws_connected = False
+        self._connected = False
         return False
 
     def is_connected(self) -> bool:
-        if not self.ws_connected:
-            return False
-
-        if not self.ws:
-            self.ws_connected = False
-            return False
-
-        if self.ws.closed:
-            self.ws_connected = False
-            return False
-
-        if self.ws.exception():
-            self.ws_connected = False
-            return False
-
-        return True
+        return self._connected and self.sio.connected
 
     async def ping(self) -> bool:
         if not self.is_connected():
             return False
 
         try:
-            await self.ws.ping()  # type: ignore[union-attr]
-            return True
+            # Socket.IO handles ping/pong internally
+            # We can use the manager to check connection state
+            return self.sio.connected
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning(f"Ping 失败: {exc}")
-            self.ws_connected = False
+            self._connected = False
             return False
 
     async def reconnect(self) -> bool:
-        logger.info("尝试重新连接 WebSocket...")
+        logger.info("尝试重新连接 Socket.IO...")
         await self._cleanup_connection()
-        self.retry_count = 0
         return await self.connect()
-
-    async def _connection_monitor(self) -> None:
-        interval = max(10, self.heartbeat_interval)
-        while self._running:
-            try:
-                await asyncio.sleep(interval)
-
-                if not self._running:
-                    break
-
-                if self.ws_connected and self.ws:
-                    if self.ws.closed or self.ws.exception():
-                        logger.warning("检测到连接异常，标记为断开")
-                        self.ws_connected = False
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:  # pylint: disable=broad-except
-                if _looks_like_connection_error(exc):
-                    logger.debug(f"连接监控任务出现异常: {exc}")
-                else:
-                    logger.error(f"连接监控任务出错: {exc}")

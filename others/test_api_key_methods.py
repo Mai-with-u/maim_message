@@ -77,8 +77,6 @@ class APIKeyMethodsTester:
             on_auth_extract_user=auth_extract_user,
             # 消息处理回调
             on_message=self._handle_message,
-            on_connect=self._handle_connect,
-            on_disconnect=self._handle_disconnect,
         )
 
         # 创建服务器

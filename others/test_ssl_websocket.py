@@ -23,8 +23,7 @@ from maim_message.message import APIMessageBase, BaseMessageInfo, Seg, MessageDi
 
 # 配置日志
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 logger = logging.getLogger(__name__)
@@ -43,9 +42,11 @@ class SSLCertificateGenerator:
         """生成自签名证书"""
         try:
             # 生成私钥
-            subprocess.run([
-                "openssl", "genrsa", "-out", self.key_file, "2048"
-            ], check=True, capture_output=True)
+            subprocess.run(
+                ["openssl", "genrsa", "-out", self.key_file, "2048"],
+                check=True,
+                capture_output=True,
+            )
 
             # 创建证书签名请求配置
             csr_config = f"""[req]
@@ -76,19 +77,44 @@ IP.1 = 127.0.0.1
             with open(os.path.join(self.temp_dir, "csr_config.cnf"), "w") as f:
                 f.write(csr_config)
 
-            subprocess.run([
-                "openssl", "req", "-new", "-key", self.key_file,
-                "-out", os.path.join(self.temp_dir, "server.csr"),
-                "-config", os.path.join(self.temp_dir, "csr_config.cnf")
-            ], check=True, capture_output=True)
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-new",
+                    "-key",
+                    self.key_file,
+                    "-out",
+                    os.path.join(self.temp_dir, "server.csr"),
+                    "-config",
+                    os.path.join(self.temp_dir, "csr_config.cnf"),
+                ],
+                check=True,
+                capture_output=True,
+            )
 
             # 创建自签名证书
-            subprocess.run([
-                "openssl", "x509", "-req", "-days", "365",
-                "-in", os.path.join(self.temp_dir, "server.csr"),
-                "-signkey", self.key_file, "-out", self.cert_file,
-                "-extensions", "v3_req", "-extfile", os.path.join(self.temp_dir, "csr_config.cnf")
-            ], check=True, capture_output=True)
+            subprocess.run(
+                [
+                    "openssl",
+                    "x509",
+                    "-req",
+                    "-days",
+                    "365",
+                    "-in",
+                    os.path.join(self.temp_dir, "server.csr"),
+                    "-signkey",
+                    self.key_file,
+                    "-out",
+                    self.cert_file,
+                    "-extensions",
+                    "v3_req",
+                    "-extfile",
+                    os.path.join(self.temp_dir, "csr_config.cnf"),
+                ],
+                check=True,
+                capture_output=True,
+            )
 
             # 将证书复制为CA证书（自签名情况）
             subprocess.run(["cp", self.cert_file, self.ca_file], check=True)
@@ -108,6 +134,7 @@ IP.1 = 127.0.0.1
     def cleanup(self):
         """清理临时文件"""
         import shutil
+
         try:
             shutil.rmtree(self.temp_dir)
             logger.info(f"✅ 清理临时SSL证书文件: {self.temp_dir}")
@@ -128,7 +155,7 @@ class SSLWebSocketTester:
             "messages_sent": 0,
             "messages_received": 0,
             "ssl_verified": False,
-            "errors": 0
+            "errors": 0,
         }
 
     async def setup_ssl_certificates(self):
@@ -146,14 +173,15 @@ class SSLWebSocketTester:
                 ssl_certfile=self.cert_generator.cert_file,
                 ssl_keyfile=self.cert_generator.key_file,
                 ssl_ca_certs=self.cert_generator.ca_file,
-                ssl_verify=False  # 自签名证书不需要验证
+                ssl_verify=False,  # 自签名证书不需要验证
             )
 
             # 设置认证和消息处理
-            config.on_auth_extract_user = lambda metadata: f"ssl_user_{metadata.get('api_key', 'unknown')}"
+            async def extract_user(metadata):
+                return f"ssl_user_{metadata.get('api_key', 'unknown')}"
+
+            config.on_auth_extract_user = extract_user
             config.on_message = self._handle_message
-            config.on_connect = self._handle_connect
-            config.on_disconnect = self._handle_disconnect
 
             # 创建服务器
             self.server = WebSocketServer(config)
@@ -173,12 +201,10 @@ class SSLWebSocketTester:
                 api_key="ssl_test_key",
                 ssl_ca_certs=self.cert_generator.ca_file if verify_cert else None,
                 ssl_verify=verify_cert,
-                ssl_check_hostname=False  # 自签名证书不需要检查主机名
+                ssl_check_hostname=False,  # 自签名证书不需要检查主机名
             )
 
             # 设置客户端回调
-            config.on_connect = self._client_on_connect
-            config.on_disconnect = self._client_on_disconnect
             config.on_message = self._client_on_message
 
             # 创建客户端
@@ -208,10 +234,12 @@ class SSLWebSocketTester:
             message_info=BaseMessageInfo(
                 platform="ssl_server",
                 message_id=f"ssl_response_{int(time.time() * 1000)}",
-                time=time.time()
+                time=time.time(),
             ),
-            message_segment=Seg(type="text", data=f"SSL服务器确认收到: {message.message_segment.data}"),
-            message_dim=MessageDim(api_key="ssl_server", platform="ssl_server")
+            message_segment=Seg(
+                type="text", data=f"SSL服务器确认收到: {message.message_segment.data}"
+            ),
+            message_dim=MessageDim(api_key="ssl_server", platform="ssl_server"),
         )
 
         # 发送响应给原发送者
@@ -231,7 +259,9 @@ class SSLWebSocketTester:
         else:
             logger.info(f"🔌 SSL客户端断开: {connection_uuid}")
 
-    async def _client_on_message(self, server_message: APIMessageBase, metadata: Dict[str, Any]):
+    async def _client_on_message(
+        self, server_message: APIMessageBase, metadata: Dict[str, Any]
+    ):
         """客户端收到消息回调"""
         self.test_results["messages_received"] += 1
         logger.info(f"📤 SSL客户端收到: {server_message.message_segment.data}")
@@ -294,7 +324,7 @@ class SSLWebSocketTester:
             test_messages = [
                 "Hello over SSL! 🛡️",
                 "SSL WebSocket测试消息",
-                "加密通信验证 🔒"
+                "加密通信验证 🔒",
             ]
 
             for i, content in enumerate(test_messages, 1):
@@ -302,10 +332,10 @@ class SSLWebSocketTester:
                     message_info=BaseMessageInfo(
                         platform="ssl_test",
                         message_id=f"ssl_msg_{i}_{int(time.time() * 1000)}",
-                        time=time.time()
+                        time=time.time(),
                     ),
                     message_segment=Seg(type="text", data=content),
-                    message_dim=MessageDim(api_key="ssl_test_key", platform="ssl_test")
+                    message_dim=MessageDim(api_key="ssl_test_key", platform="ssl_test"),
                 )
 
                 success = await client.send_message(message)
@@ -354,18 +384,26 @@ class SSLWebSocketTester:
         logger.info("=" * 60)
         logger.info("🔒 SSL WebSocket测试完成!")
         logger.info("=" * 60)
-        logger.info(f"✅ 服务器启动: {'成功' if self.test_results['server_started'] else '失败'}")
-        logger.info(f"✅ 客户端连接: {'成功' if self.test_results['client_connected'] else '失败'}")
-        logger.info(f"✅ SSL验证: {'通过' if self.test_results['ssl_verified'] else '失败'}")
+        logger.info(
+            f"✅ 服务器启动: {'成功' if self.test_results['server_started'] else '失败'}"
+        )
+        logger.info(
+            f"✅ 客户端连接: {'成功' if self.test_results['client_connected'] else '失败'}"
+        )
+        logger.info(
+            f"✅ SSL验证: {'通过' if self.test_results['ssl_verified'] else '失败'}"
+        )
         logger.info(f"📤 发送消息数: {self.test_results['messages_sent']}")
         logger.info(f"📨 接收消息数: {self.test_results['messages_received']}")
         logger.info(f"❌ 错误数: {self.test_results['errors']}")
         logger.info("=" * 60)
 
-        if (self.test_results['server_started'] and
-            self.test_results['client_connected'] and
-            self.test_results['ssl_verified'] and
-            self.test_results['errors'] == 0):
+        if (
+            self.test_results["server_started"]
+            and self.test_results["client_connected"]
+            and self.test_results["ssl_verified"]
+            and self.test_results["errors"] == 0
+        ):
             logger.info("🎉 所有SSL测试通过！WebSocket SSL/TLS功能正常！")
         else:
             logger.warning("⚠️ SSL测试存在问题，请检查日志")
@@ -425,6 +463,7 @@ async def main():
     except Exception as e:
         logger.error(f"❌ SSL测试失败: {e}")
         import traceback
+
         logger.error(f"   Traceback: {traceback.format_exc()}")
     finally:
         logger.info("🏁 SSL测试程序退出")

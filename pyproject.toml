@@ -1,7 +1,7 @@
 [project]
 name = "maim_message"
-version = "0.6.8"
-description = "A message handling library"
+version = "0.7.0"
+description = "A message handling library with Socket.IO support"
 authors = [{ name = "tcmofashi" }]
 requires-python = ">=3.10"
 dependencies = [
@@ -9,8 +9,8 @@ dependencies = [
     "uvicorn>=0.15.0",
     "aiohttp>=3.8.0",
     "pydantic>=1.9.0",
-    "websockets>=10.0",
-    'cryptography',
+    "python-socketio[asyncio]>=5.0.0",
+    "cryptography",
 ]
 
 [build-system]
