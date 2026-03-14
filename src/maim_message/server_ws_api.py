@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Optional, Set
 
-from .server_ws_connection import ServerNetworkDriver, EventType, NetworkEvent
+from .server_socketio_driver import ServerSocketIODriver, EventType, NetworkEvent
 from .message import APIMessageBase, BaseMessageInfo, Seg, MessageDim
 from .ws_config import ServerConfig, AuthResult
 
@@ -28,7 +28,7 @@ class WebSocketServer:
         self.logger = self.config.get_logger()
 
         # 网络驱动器
-        self.network_driver = ServerNetworkDriver(
+        self.network_driver = ServerSocketIODriver(
             self.config.host,
             self.config.port,
             self.config.path,

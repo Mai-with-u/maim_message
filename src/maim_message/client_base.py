@@ -7,7 +7,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Set
 
-from .client_ws_connection import ClientNetworkDriver, EventType, NetworkEvent
+from .client_socketio_driver import ClientNetworkDriver, EventType, NetworkEvent
 from .ws_config import ClientConfig
 
 
@@ -118,6 +118,10 @@ class WebSocketClientBase(ABC):
         """处理消息事件 - 子类可以重写此方法"""
         try:
             payload = event.payload
+            if payload is None:
+                self.logger.warning("收到空消息事件")
+                return
+
             self.stats["messages_received"] += 1
 
             # 处理标准消息
@@ -128,7 +132,6 @@ class WebSocketClientBase(ABC):
                         await self._handle_standard_message(payload)
                     except Exception as e:
                         self.logger.error(f"处理标准消息时出错: {e}")
-
             # 处理自定义消息
             elif payload.get("type", "").startswith("custom_"):
                 message_type = payload.get("type")
@@ -147,12 +150,13 @@ class WebSocketClientBase(ABC):
                         )
                 else:
                     self.logger.warning(f"未找到自定义消息处理器: {message_type}")
-
         except Exception as e:
             self.logger.error(f"处理消息事件时出错: {e}")
 
-    async def _handle_standard_message(self, payload: Dict[str, Any]) -> None:
+    async def _handle_standard_message(self, payload: Optional[Dict[str, Any]]) -> None:
         """处理标准消息 - 子类可以重写此方法"""
+        if payload is None:
+            return
         if self.default_config and self.default_config.on_message:
             message_data = payload.get("payload", {})
             if message_data:
@@ -160,7 +164,7 @@ class WebSocketClientBase(ABC):
 
                 message = APIMessageBase.from_dict(message_data)
                 await self._create_handler_task(
-                    self.default_config.on_message(message, payload.get("meta", {})),
+                    self.default_config.on_message(message, payload.get("meta") or {}),
                     "客户端标准消息处理器",
                 )
 

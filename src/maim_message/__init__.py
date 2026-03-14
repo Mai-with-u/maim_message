@@ -1,6 +1,6 @@
 """Maim Message - A message handling library"""
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 # Legacy API Components (pre-API-Server Version) - 从根模块导入
 from .api import MessageClient, MessageServer
