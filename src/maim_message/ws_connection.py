@@ -80,9 +80,13 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
         self.enable_token = enable_token
         self.valid_tokens: Set[str] = set()
 
-        # Socket.IO server
+        # Detect if external app is FastAPI (ASGI) or aiohttp
+        self._is_asgi_app = self._detect_asgi_app(app) if app else False
+
+        # Socket.IO server - use appropriate async mode
+        async_mode = "asgi" if self._is_asgi_app else "aiohttp"
         self.sio = socketio.AsyncServer(
-            async_mode="aiohttp",
+            async_mode=async_mode,
             ping_interval=25,
             ping_timeout=5,
             cors_allowed_origins="*",
@@ -97,9 +101,9 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
 
         self._setup_socketio_handlers()
 
-        # If using external app, mount Socket.IO
-        if not self.own_app:
-            self.sio.attach(self.app, socketio_path=self.path.lstrip("/"))
+        # If using external app, mount Socket.IO appropriately
+        if not self.own_app and app is not None:
+            self._mount_to_external_app(app)
 
     # ------------------------------------------------------------------
     # Socket.IO 事件处理
@@ -164,6 +168,32 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
 
     def remove_valid_token(self, token: str) -> None:
         self.valid_tokens.discard(token)
+
+    def _detect_asgi_app(self, app: Any) -> bool:
+        """Detect if the app is an ASGI app (FastAPI, Starlette, etc.)"""
+        app_type = type(app).__name__
+        module = getattr(type(app), "__module__", "")
+        if "fastapi" in module.lower() or "starlette" in module.lower():
+            return True
+        if app_type in ("FastAPI", "Starlette"):
+            return True
+        if hasattr(app, "add_api_route") or hasattr(app, "add_api_websocket_route"):
+            return True
+        if hasattr(app, "router") and hasattr(app.router, "add_route"):
+            return False
+        return False
+
+    def _mount_to_external_app(self, app: Any) -> None:
+        if self._is_asgi_app:
+            from socketio import ASGIApp
+
+            asgi_app = ASGIApp(self.sio, socketio_path=self.path.lstrip("/"))
+            mount_path = self.path if self.path.startswith("/") else "/" + self.path
+            app.mount(mount_path, asgi_app)
+            logger.info(f"Socket.IO 已挂载到 ASGI 应用的路径: {mount_path}")
+        else:
+            self.sio.attach(app, socketio_path=self.path.lstrip("/"))
+            logger.info(f"Socket.IO 已挂载到 aiohttp 应用")
 
     def _validate_ssl_files(self) -> None:
         if self.ssl_certfile and not os.path.exists(self.ssl_certfile):
@@ -546,6 +576,9 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
             if self.sio.connected:
                 await self.sio.disconnect()
                 logger.debug("Socket.IO 连接已关闭")
+        except asyncio.CancelledError:
+            # 任务被取消是正常的，不需要警告
+            logger.debug("Socket.IO 断开时任务被取消")
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning(f"关闭 Socket.IO 时出现异常: {exc}")
 

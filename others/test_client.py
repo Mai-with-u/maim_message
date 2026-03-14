@@ -63,7 +63,8 @@ def construct_message(platform):
         format_info=format_info,
         template_info=None,
         additional_config={
-            "maimcore_reply_probability_gain": 0.5  # 回复概率增益
+            "at_bot": True,  # 标记消息@了机器人，触发强制回复
+            "is_mentioned": 1.0,  # 回复概率100%
         },
     )
 
@@ -93,22 +94,28 @@ def construct_message(platform):
 
 async def message_handler(message):
     """消息处理函数"""
-    print(f"收到消息: {message}")
+    import json
+
+    print(f"\n========== 收到消息 ==========", flush=True)
+    print(json.dumps(message, ensure_ascii=False, indent=2)[:500], flush=True)
+    print("=============================\n", flush=True)
 
 
 # 配置路由
+# 注意：Legacy API (Router + MessageClient) 使用 Socket.IO 协议
+# 应连接到 MaiBot 的 Legacy Server 端口 (8000)，而不是新版 WebSocket Server 端口 (8090)
 route_config = RouteConfig(
     route_config={
         "qq123": TargetConfig(
-            url="ws://127.0.0.1:8090/ws",  # 使用ws协议
-            token=None,  # 如果需要token验证则在这里设置
+            url="ws://127.0.0.1:8000/ws",
+            token=None,
         ),
         "qq321": TargetConfig(
-            url="ws://127.0.0.1:8090/ws",
+            url="ws://127.0.0.1:8000/ws",
             token=None,
         ),
         "qq111": TargetConfig(
-            url="ws://127.0.0.1:8090/ws",
+            url="ws://127.0.0.1:8000/ws",
             token=None,
         ),
     }
@@ -124,13 +131,23 @@ async def main():
 
     try:
         # 启动路由器（会自动连接所有配置的平台）
+        print("启动路由器...", flush=True)
         router_task = asyncio.create_task(router.run())
 
         # 等待连接建立
         await asyncio.sleep(2)
+        print("连接已建立，准备发送消息...", flush=True)
 
         # 发送测试消息
-        await router.send_message(construct_message("qq123"))
+        print("发送测试消息到 qq123...", flush=True)
+        try:
+            result = await router.send_message(construct_message("qq123"))
+            print(f"消息发送结果: {result}", flush=True)
+        except Exception as e:
+            print(f"发送消息失败: {e}", flush=True)
+            import traceback
+
+            traceback.print_exc()
 
         # 等待3秒后更新配置
         await asyncio.sleep(3)
@@ -141,18 +158,18 @@ async def main():
             "route_config": {
                 # 保持qq123不变
                 "qq123": {
-                    "url": "ws://127.0.0.1:8090/ws",
+                    "url": "ws://127.0.0.1:8000/ws",
                     "token": None,
                 },
                 # 移除qq321
                 # 更改qq111的token
                 "qq111": {
-                    "url": "ws://127.0.0.1:8090/ws",
+                    "url": "ws://127.0.0.1:8000/ws",
                     "token": None,
                 },
                 # 添加新平台
                 "qq999": {
-                    "url": "ws://127.0.0.1:8090/ws",
+                    "url": "ws://127.0.0.1:8000/ws",
                     "token": None,
                 },
             }
