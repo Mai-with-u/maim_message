@@ -7,11 +7,11 @@ server and client implementations.
 
 # Server components
 from ..server_ws_api import WebSocketServer
-from ..server_ws_connection import ServerNetworkDriver
+from ..server_socketio_driver import ServerSocketIODriver as ServerNetworkDriver
 
 # Client components
 from ..client_ws_api import WebSocketClient
-from ..client_ws_connection import ClientNetworkDriver
+from ..client_socketio_driver import ClientNetworkDriver
 
 # Message and data structures (from message module)
 from ..message import (
@@ -44,13 +44,11 @@ __all__ = [
     # Server Components
     "WebSocketServer",
     "ServerNetworkDriver",
-
     # Client Components
     "WebSocketClient",
     "ClientNetworkDriver",
-
     # Message Classes (API-Server Version)
-    "APIMessageBase",          # 主要消息类
+    "APIMessageBase",  # 主要消息类
     "MessageDim",
     "Seg",
     "BaseMessageInfo",
@@ -61,7 +59,6 @@ __all__ = [
     "ReceiverInfo",
     "FormatInfo",
     "TemplateInfo",
-
     # Configuration
     "ServerConfig",
     "ClientConfig",
