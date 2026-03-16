@@ -35,20 +35,35 @@ class EventType(Enum):
 
 @dataclass
 class ConnectionConfig:
-    """连接配置"""
+    """连接配置
+
+    Socket.IO 客户端可靠性配置说明：
+    - reconnection: 自动重连（在 _connection_loop 中配置）
+    - reconnection_attempts=0: 无限重连，直到连接成功或手动停止
+    - transports=["polling", "websocket"]: 传输降级策略，先 polling 再升级到 websocket
+    - 心跳(heartbeat): 由服务端控制，客户端自动响应服务端的 ping
+
+    注意：ping_interval 和 ping_timeout 是服务端参数，客户端无需配置。
+    客户端会自动遵循服务端在握手时发送的心跳配置。
+    """
 
     url: str
     api_key: str
     platform: str
     connection_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
     headers: Dict[str, str] = field(default_factory=dict)
-    ping_interval: int = 20
-    ping_timeout: int = 10
+
+    # 心跳配置说明（仅供参考，实际由服务端控制）
+    # 服务端默认: ping_interval=25s, ping_timeout=20s
+    ping_interval: int = 20  # 客户端期望的心跳间隔（实际由服务端决定）
+    ping_timeout: int = 10  # 客户端期望的心跳超时（实际由服务端决定）
     close_timeout: int = 10
     max_size: int = 104_857_600
-    max_reconnect_attempts: int = 5
-    reconnect_delay: float = 2.0
-    max_reconnect_delay: float = 10.0
+
+    # 重连配置
+    max_reconnect_attempts: int = 0  # 0 表示无限重连
+    reconnect_delay: float = 1.0  # 初始重连延迟（秒）
+    max_reconnect_delay: float = 10.0  # 最大重连延迟（秒）
 
     # SSL配置
     ssl_enabled: bool = False
@@ -61,7 +76,7 @@ class ConnectionConfig:
     # Socket.IO 特有配置
     socketio_path: str = "socket.io"
 
-    transports: List[str] = field(default_factory=lambda: ["websocket"])
+    transports: List[str] = field(default_factory=lambda: ["polling", "websocket"])
 
     auth: Optional[Dict[str, Any]] = None
 
@@ -281,7 +296,7 @@ class ClientNetworkDriver:
             return False
         try:
             self.connection_states[connection_uuid] = "disconnecting"
-            # 壜止连接任务
+            # 停止连接任务
             if connection_uuid in self.connection_tasks:
                 task = self.connection_tasks[connection_uuid]
                 if task and not task.done():
@@ -292,14 +307,17 @@ class ClientNetworkDriver:
             if connection_uuid in self.active_connections:
                 sio = self.active_connections[connection_uuid]
                 try:
+                    # 禁用自动重连后再断开
+                    sio.reconnection = False
                     await sio.disconnect()
                     self.logger.info(f"等待 {connection_uuid} 断开...")
                     await asyncio.sleep(0.5)
                     self.logger.info(f"连接 {connection_uuid} 已断开")
                 except Exception as e:
-                    self.logger.debug(f"断开 WebSocket 锶 {connection_uuid} 错: {e}")
+                    self.logger.debug(f"断开 {connection_uuid} 出错: {e}")
                 finally:
-                    del self.active_connections[connection_uuid]
+                    if connection_uuid in self.active_connections:
+                        del self.active_connections[connection_uuid]
                     self.logger.info(f"从活跃连接移除 {connection_uuid}")
             self.connection_states[connection_uuid] = "disconnected"
             return True
@@ -308,151 +326,128 @@ class ClientNetworkDriver:
             self.connection_states[connection_uuid] = "disconnected"
             return True
 
-    async def _connection_loop(self, connection_uuid: str) -> None:
-        """连接管理循环"""
-        self.logger.info(f"开始连接循环: {connection_uuid}")
-        config = self.connections[connection_uuid]
-        reconnect_delay = config.reconnect_delay
-        reconnect_attempts = 0
-        consecutive_failures = 0
-        # 创建 Socket.IO 客户端
-        sio = socketio.AsyncClient(
-            reconnection=True,
-            reconnection_attempts=0,  # 无限重连
-            reconnection_delay=1,
-            reconnection_delay_max=5,
-        )
-        # 设置 SSL
+    def _create_socketio_client(self, config: ConnectionConfig) -> socketio.AsyncClient:
+        """创建配置好的 Socket.IO 客户端
+
+        使用 Socket.IO 内置重连机制，配置如下：
+        - reconnection=True: 启用自动重连
+        - reconnection_attempts=0: 无限重连（由 Socket.IO 内部管理）
+        - reconnection_delay: 初始重连延迟
+        - reconnection_delay_max: 最大重连延迟
+        - randomization_factor: 随机化因子，避免惊群效应
+        """
+        client_kwargs = {
+            "reconnection": True,
+            "reconnection_attempts": 0,  # 0 = 无限重连，由 Socket.IO 管理
+            "reconnection_delay": config.reconnect_delay,
+            "reconnection_delay_max": config.max_reconnect_delay,
+            "randomization_factor": 0.5,
+            "request_timeout": 10,
+        }
+
+        # SSL 支持
         ssl_context = self._build_ssl_context(config)
         if ssl_context:
-            # 创建带有 SSL 的 HTTP session
             connector = aiohttp.TCPConnector(ssl=ssl_context)
             self._http_session = aiohttp.ClientSession(connector=connector)
             self._ssl_context = ssl_context
-            # 重新创建带有 HTTP session 的 Socket.IO 客户端
-            sio = socketio.AsyncClient(
-                reconnection=True,
-                reconnection_attempts=0,
-                reconnection_delay=1,
-                reconnection_delay_max=5,
-                http_session=self._http_session,
+            client_kwargs["http_session"] = self._http_session
+
+        return socketio.AsyncClient(**client_kwargs)
+
+    async def _connection_loop(self, connection_uuid: str) -> None:
+        """连接管理循环 - 使用 Socket.IO 内置重连"""
+        self.logger.info(f"开始连接循环: {connection_uuid}")
+        config = self.connections[connection_uuid]
+
+        # 创建 Socket.IO 客户端（内置重连）
+        sio = self._create_socketio_client(config)
+
+        # 注册 Socket.IO 事件处理器
+        @sio.event
+        async def connect() -> None:
+            self.active_connections[connection_uuid] = sio
+            self.connection_states[connection_uuid] = "connected"
+            self.stats["total_connections"] += 1
+            self.stats["current_connections"] += 1
+            self.logger.info(f"连接 {connection_uuid} 已建立 (Socket.IO 自动连接/重连)")
+            await self._send_event(EventType.CONNECT, connection_uuid)
+            await self._retry_cached_messages(connection_uuid)
+
+        @sio.event
+        async def disconnect() -> None:
+            if connection_uuid in self.active_connections:
+                del self.active_connections[connection_uuid]
+            self.stats["current_connections"] = max(
+                0, self.stats["current_connections"] - 1
             )
-        while (
-            self.running
-            and connection_uuid in self.connections
-            and not self._shutdown_event.is_set()
-        ):
-            if (
-                config.max_reconnect_attempts > 0
-                and reconnect_attempts >= config.max_reconnect_attempts
-            ):
-                self.logger.error(
-                    f"连接 {connection_uuid} 达到最大重连次数 {config.max_reconnect_attempts}"
-                )
-                break
-            try:
-                # 尝试连接
-                self.connection_states[connection_uuid] = "connecting"
-                self.logger.info(f"连接 {connection_uuid} 到 {config.url}")
-                # 提取 URL 中的 path
-                from urllib.parse import urlparse
+            self.connection_states[connection_uuid] = "disconnected"
+            self.logger.info(f"连接 {connection_uuid} 已断开 (Socket.IO 将自动重连)")
+            await self._send_event(EventType.DISCONNECT, connection_uuid)
 
-                parsed = urlparse(
-                    config.url.replace("wss://", "https://").replace("ws://", "http://")
-                )
-                socketio_path = parsed.path if parsed.path else config.socketio_path
-                extra_headers = config.get_headers()
-                if config.auth:
-                    extra_headers.update(config.auth)
-                # 连接选项
-                connect_kwargs = {
-                    "socketio_path": socketio_path,
-                    "headers": extra_headers,
-                    "wait_timeout": config.wait_timeout,
-                    "transports": config.transports,
-                }
-                self.logger.info(
-                    f"Socket.IO 连接参数: path={socketio_path}, headers={extra_headers}"
-                )
-                await sio.connect(
-                    config.url.replace("wss://", "https://").replace(
-                        "ws://", "http://"
-                    ),
-                    **connect_kwargs,
-                )
-                self.active_connections[connection_uuid] = sio
-                self.connection_states[connection_uuid] = "connected"
-                reconnect_attempts = 0
-                reconnect_delay = config.reconnect_delay
-                # 更新统计
-                self.stats["total_connections"] += 1
-                self.stats["current_connections"] += 1
-                self.logger.info(f"连接 {connection_uuid} 已建立")
-                await self._send_event(EventType.CONNECT, connection_uuid)
-                consecutive_failures = 0
-                self.logger.info("连接成功, 重置连续失败计数")
-                # 重发缓存消息
-                await self._retry_cached_messages(connection_uuid)
+        @sio.event
+        async def connect_error(data: Any) -> None:
+            self.logger.warning(f"连接 {connection_uuid} 错误: {data}")
+            self.connection_states[connection_uuid] = "connecting"
 
-                # 设置消息处理器
-                @sio.on("message")  # type: ignore[union-attr]
-                async def on_message(data: Any) -> None:
-                    await self._handle_message(connection_uuid, data)
+        @sio.on("message")
+        async def on_message(data: Any) -> None:
+            await self._handle_message(connection_uuid, data)
 
-                # 等待连接断开或关闭信号
-                while self.running and connection_uuid in self.connections:
-                    try:
-                        await asyncio.sleep(1.0)
-                    except asyncio.CancelledError:
-                        break
-            except Exception as e:
-                if self.running:
-                    error_msg = str(e)
-                    self.logger.warning(f"连接 {connection_uuid} 异常关闭: {e}")
-                else:
-                    self.logger.info(f"连接 {connection_uuid} 已关闭: {e}")
-                await self._send_event(
-                    EventType.DISCONNECT, connection_uuid, error=str(e)
-                )
+        # 连接到服务器
+        try:
+            self.connection_states[connection_uuid] = "connecting"
+            self.logger.info(f"连接 {connection_uuid} 到 {config.url}")
 
-            finally:
-                # 清理连接状态
-                self.logger.debug(f"清理连接 {connection_uuid} 的状态")
-                if connection_uuid in self.active_connections:
-                    del self.active_connections[connection_uuid]
-                self.stats["current_connections"] -= 1
-                self.connection_states[connection_uuid] = "disconnected"
-                self.logger.debug(
-                    f"连接状态: disconnected, 当前连接数: {self.stats['current_connections']}"
-                )
-            # 重连逻辑
-            should_reconnect = (
-                self.running
-                and connection_uuid in self.connections
-                and not self._shutdown_event.is_set()
+            # 提取 URL 中的 path
+            from urllib.parse import urlparse
+
+            parsed = urlparse(
+                config.url.replace("wss://", "https://").replace("ws://", "http://")
             )
-            if should_reconnect:
-                reconnect_attempts += 1
-                self.logger.info(
-                    f"{connection_uuid} 将在 {reconnect_delay}s 后进行第 {reconnect_attempts} 次重连"
-                )
-                try:
-                    await asyncio.wait_for(asyncio.sleep(reconnect_delay), timeout=30.0)
-                    self.logger.debug("重连等待完成")
-                except asyncio.TimeoutError:
-                    self.logger.debug("重连等待超时")
-                pass
+            socketio_path = parsed.path if parsed.path else config.socketio_path
+            extra_headers = config.get_headers()
+            if config.auth:
+                extra_headers.update(config.auth)
+
+            connect_kwargs = {
+                "socketio_path": socketio_path,
+                "headers": extra_headers,
+                "wait_timeout": config.wait_timeout,
+                "transports": config.transports,
+            }
+            self.logger.info(
+                f"Socket.IO 连接参数: path={socketio_path}, transports={config.transports}"
+            )
+
+            # 首次连接（Socket.IO 处理后续重连）
+            await sio.connect(
+                config.url.replace("wss://", "https://").replace("ws://", "http://"),
+                **connect_kwargs,
+            )
+
+            # 保持任务运行，等待关闭信号
+            while self.running and connection_uuid in self.connections:
                 if self._shutdown_event.is_set():
-                    self.logger.info(f"收到关闭信号, 停止 {connection_uuid} 的重连")
+                    self.logger.info(f"收到关闭信号，断开 {connection_uuid}")
                     break
-                reconnect_delay = min(config.max_reconnect_delay, reconnect_delay * 2)
-            else:
-                if connection_uuid in self.connections:
-                    if self._shutdown_event.is_set():
-                        self.logger.info(f"{connection_uuid} 优雅关闭")
-                else:
-                    self.logger.info(f"连接 {connection_uuid} 已移除, 停止重连")
-                break
+                await asyncio.sleep(1.0)
+
+        except Exception as e:
+            self.logger.error(f"连接 {connection_uuid} 初始化失败: {e}")
+            self.connection_states[connection_uuid] = "disconnected"
+            await self._send_event(EventType.DISCONNECT, connection_uuid, error=str(e))
+        finally:
+            # 清理
+            if connection_uuid in self.active_connections:
+                del self.active_connections[connection_uuid]
+            self.connection_states[connection_uuid] = "disconnected"
+            try:
+                sio.reconnection = False  # 禁用自动重连后再断开
+                await sio.disconnect()
+            except Exception:
+                pass
+            self.logger.info(f"连接循环 {connection_uuid} 已结束")
 
     async def _handle_message(self, connection_uuid: str, message: Any) -> None:
         """处理接收到的消息"""

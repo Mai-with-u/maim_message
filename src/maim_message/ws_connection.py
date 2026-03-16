@@ -61,8 +61,8 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
         enable_token: bool = False,
         enable_custom_uvicorn_logger: bool = False,
         max_message_size: int = 104_857_600,
-        heartbeat_interval: float = 30.0,
-        heartbeat_timeout: float = 10.0,
+        heartbeat_interval: float = 25.0,
+        heartbeat_timeout: float = 20.0,
     ) -> None:
         super().__init__()
         self.host = host
@@ -87,8 +87,8 @@ class WebSocketServer(BaseConnection, ServerConnectionInterface):
         async_mode = "asgi" if self._is_asgi_app else "aiohttp"
         self.sio = socketio.AsyncServer(
             async_mode=async_mode,
-            ping_interval=25,
-            ping_timeout=5,
+            ping_interval=int(heartbeat_interval),
+            ping_timeout=int(heartbeat_timeout),
             cors_allowed_origins="*",
             max_http_buffer_size=max_message_size,
         )
@@ -400,13 +400,22 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
         # aiohttp session for SSL connections
         self.http_session: Optional[aiohttp.ClientSession] = None
 
-        # Socket.IO client
+        # Socket.IO client - 可靠性配置
+        # - reconnection=True: 启用自动重连
+        # - reconnection_attempts=0: 无限重连尝试
+        # - reconnection_delay=1: 初始重连延迟 1 秒
+        # - reconnection_delay_max=10: 最大重连延迟 10 秒
+        # - randomization_factor=0.5: 重连延迟随机化因子
+        # - request_timeout=10: HTTP 请求超时 10 秒
+        # 心跳(heartbeat): 由服务端控制，客户端自动响应服务端的 ping
         self.sio = socketio.AsyncClient(
             reconnection=True,
-            reconnection_attempts=0,  # infinite
+            reconnection_attempts=0,
             reconnection_delay=1,
-            reconnection_delay_max=5,
-            http_session=None,  # Will be set in configure() when SSL is needed
+            reconnection_delay_max=10,
+            randomization_factor=0.5,
+            request_timeout=10,
+            http_session=None,
         )
 
         self._connected = False
@@ -420,7 +429,12 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
         @self.sio.event
         async def connect() -> None:
             self._connected = True
-            logger.info(f"已连接到服务器")
+            logger.info(f"已连接到服务器 (sid={getattr(self.sio, 'sid', 'unknown')})")
+
+        @self.sio.event
+        async def connect_error(data) -> None:
+            self._connected = False
+            logger.error(f"连接失败: {data}")
 
         @self.sio.event
         async def disconnect() -> None:
@@ -471,12 +485,14 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
             ssl_context.load_verify_locations(self.ssl_verify)
             connector = aiohttp.TCPConnector(ssl=ssl_context)
             self.http_session = aiohttp.ClientSession(connector=connector)
-            # Reinitialize sio with http_session
+            # 保持相同的可靠性配置
             self.sio = socketio.AsyncClient(
                 reconnection=True,
                 reconnection_attempts=0,
                 reconnection_delay=1,
-                reconnection_delay_max=5,
+                reconnection_delay_max=10,
+                randomization_factor=0.5,
+                request_timeout=10,
                 http_session=self.http_session,
             )
         elif self.url.startswith("https://"):
@@ -486,11 +502,14 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
             ssl_context.verify_mode = ssl.CERT_NONE
             connector = aiohttp.TCPConnector(ssl=ssl_context)
             self.http_session = aiohttp.ClientSession(connector=connector)
+            # 保持相同的可靠性配置
             self.sio = socketio.AsyncClient(
                 reconnection=True,
                 reconnection_attempts=0,
                 reconnection_delay=1,
-                reconnection_delay_max=5,
+                reconnection_delay_max=10,
+                randomization_factor=0.5,
+                request_timeout=10,
                 http_session=self.http_session,
             )
 
@@ -503,6 +522,9 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
 
         options: Dict[str, Any] = {
             "headers": self.headers,
+            # 传输降级策略：先 polling 再升级到 websocket
+            # 确保即使 websocket 不可用也能连接
+            "transports": ["polling", "websocket"],
         }
 
         # http_session is now set in configure() method when SSL is needed
@@ -516,10 +538,22 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
             path = parsed.path if parsed.path else "/ws"
 
             logger.info(f"正在连接到 {self.url} (path={path})")
-            await self.sio.connect(self.url, socketio_path=path.lstrip("/"), **options)
+            await self.sio.connect(
+                self.url,
+                socketio_path=path.lstrip("/"),
+                wait=True,
+                wait_timeout=10,
+                **options,
+            )
+
+            # 验证连接状态
+            if not self.sio.connected or not getattr(self.sio, "sid", None):
+                logger.error("连接建立但 namespace 未就绪")
+                self._connected = False
+                return False
 
             self._connected = True
-            logger.info(f"已成功连接到 {self.url}")
+            logger.info(f"已成功连接到 {self.url} (sid={self.sio.sid})")
             return True
 
         except Exception as exc:  # pylint: disable=broad-except
@@ -607,7 +641,13 @@ class WebSocketClient(BaseConnection, ClientConnectionInterface):
         return False
 
     def is_connected(self) -> bool:
-        return self._connected and self.sio.connected
+        """检查连接状态，使用 sid 确认 namespace 连接已完成"""
+        if not self._connected:
+            return False
+        if not self.sio.connected:
+            return False
+        # 关键：检查 sid 是否存在，确保 namespace 连接完成
+        return bool(getattr(self.sio, "sid", None))
 
     async def ping(self) -> bool:
         if not self.is_connected():

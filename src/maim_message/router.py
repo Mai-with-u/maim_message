@@ -64,52 +64,7 @@ class Router:
         self.handlers: List[Callable] = []
         self._running = False
         self._client_tasks: Dict[str, asyncio.Task] = {}
-        self._monitor_task = None
-        # 添加自定义消息类型处理器字典
         self.custom_message_handlers: Dict[str, List[Callable]] = {}
-
-    async def _monitor_connections(self):
-        """监控所有客户端连接状态"""
-        await asyncio.sleep(3)  # 等待初始连接建立
-        while self._running:
-            for platform in list(self.clients.keys()):
-                # 检查连接状态
-                client = self.clients.get(platform)
-                if client is None or not client.is_connected():
-                    logger.info(f"检测到平台 {platform} 的连接已断开，正在尝试重新连接")
-                    await self._reconnect_platform(platform)
-            await asyncio.sleep(5)  # 每5秒检查一次
-
-    async def _reconnect_platform(self, platform: str):
-        """重新连接指定平台"""
-        if platform in self._client_tasks:
-            task = self._client_tasks.pop(platform)
-            try:
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                else:
-                    # 安全地检查异常
-                    try:
-                        exc = task.exception()
-                        if exc:
-                            logger.warning(f"平台 {platform} 的任务异常完成: {exc}")
-                        else:
-                            logger.debug(f"平台 {platform} 的任务正常完成")
-                    except (asyncio.InvalidStateError, RuntimeError) as e:
-                        # 处理任务状态异常
-                        logger.debug(f"检查任务异常时出错: {e}")
-            except Exception as e:
-                logger.error(f"处理平台 {platform} 的任务时出错: {e}")
-
-        if platform in self.clients:
-            await self.clients[platform].stop()
-            del self.clients[platform]
-
-        await self.connect(platform)
 
     async def add_platform(self, platform: str, config: TargetConfig):
         """动态添加新平台"""
@@ -179,8 +134,8 @@ class Router:
                 if platform not in self.clients:
                     await self.connect(platform)
 
-            # 启动连接监控任务
-            self._monitor_task = asyncio.create_task(self._monitor_connections())
+            # Socket.IO 内置重连机制会自动处理断连重连
+            # 不再需要 _monitor_connections 监控任务
 
             # 等待运行状态改变
             while self._running:
@@ -197,16 +152,7 @@ class Router:
         """停止所有客户端"""
         self._running = False
 
-        # 取消连接监控任务
-        if self._monitor_task and not self._monitor_task.done():
-            self._monitor_task.cancel()
-            try:
-                await self._monitor_task
-            except asyncio.CancelledError:
-                pass
-        self._monitor_task = None
-
-        # 然后停止所有客户端
+        # 停止所有客户端
         stop_tasks = []
         for client in self.clients.values():
             stop_tasks.append(client.stop())

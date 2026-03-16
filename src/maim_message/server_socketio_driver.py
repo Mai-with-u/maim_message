@@ -89,7 +89,7 @@ class ServerNetworkDriver:
         max_message_size: int = 104_857_600,
         custom_logger: Optional[Any] = None,
         heartbeat_interval: float = 25.0,
-        heartbeat_timeout: float = 5.0,
+        heartbeat_timeout: float = 20.0,
     ):
         self.host = host
         self.port = port
